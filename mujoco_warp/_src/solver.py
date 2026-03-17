@@ -121,8 +121,29 @@ def create_solver_context(m: types.Model, d: types.Data) -> SolverContext:
   alloc_h = m.opt.solver == types.SolverType.NEWTON
   alloc_hfactor = alloc_h and nv > _BLOCK_CHOLESKY_DIM
 
+  # Alias Data's retained arrays when available (shape[1] > 0 means real alloc);
+  # fall back to local allocation for backward compatibility.
+  if alloc_h and d.solver_h.shape[1] > 0:
+    h = d.solver_h
+  elif alloc_h:
+    h = wp.zeros((nworld, nv_pad, nv_pad), dtype=float)
+  else:
+    h = wp.empty((nworld, 0, 0), dtype=float)
+
+  if alloc_hfactor and d.solver_hfactor.shape[1] > 0:
+    hfactor = d.solver_hfactor
+  elif alloc_hfactor:
+    hfactor = wp.zeros((nworld, nv_pad, nv_pad), dtype=float)
+  else:
+    hfactor = wp.empty((nworld, 0, 0), dtype=float)
+
+  if d.solver_Jaref.shape[0] > 0:
+    Jaref = d.solver_Jaref
+  else:
+    Jaref = wp.empty((nworld, njmax), dtype=float)
+
   return SolverContext(
-    Jaref=wp.empty((nworld, njmax), dtype=float),
+    Jaref=Jaref,
     search_dot=wp.empty((nworld,), dtype=float),
     gauss=wp.empty((nworld,), dtype=float),
     cost=wp.empty((nworld,), dtype=float),
@@ -140,8 +161,8 @@ def create_solver_context(m: types.Model, d: types.Data) -> SolverContext:
     prev_grad=wp.empty((nworld, nv), dtype=float),
     prev_Mgrad=wp.empty((nworld, nv), dtype=float),
     beta=wp.empty((nworld,), dtype=float),
-    h=wp.zeros((nworld, nv_pad, nv_pad), dtype=float) if alloc_h else wp.empty((nworld, 0, 0), dtype=float),
-    hfactor=wp.zeros((nworld, nv_pad, nv_pad), dtype=float) if alloc_hfactor else wp.empty((nworld, 0, 0), dtype=float),
+    h=h,
+    hfactor=hfactor,
     changed_efc_ids=wp.empty((nworld, njmax), dtype=int) if alloc_h else wp.empty((nworld, 0), dtype=int),
     changed_efc_count=wp.empty((nworld,), dtype=int) if alloc_h else wp.empty((0,), dtype=int),
   )
