@@ -1019,6 +1019,17 @@ def forward(m: Model, d: Data):
   fwd_acceleration(m, d, factorize=True)
 
   solver.solve(m, d)
+
+  # Record implicit differentiation adjoint on the active tape
+  tape = wp._src.context.runtime.tape
+  if tape is not None and d.qpos.requires_grad:
+    from mujoco_warp._src.adjoint import solver_implicit_adjoint
+
+    tape.record_func(
+      lambda m=m, d=d: solver_implicit_adjoint(m, d),
+      [d.qacc, d.qacc_smooth],
+    )
+
   sensor.sensor_acc(m, d)
 
 
@@ -1074,6 +1085,17 @@ def step2(m: Model, d: Data):
   fwd_actuation(m, d)
   fwd_acceleration(m, d)
   solver.solve(m, d)
+
+  # Record implicit differentiation adjoint on the active tape
+  tape = wp._src.context.runtime.tape
+  if tape is not None and d.qpos.requires_grad:
+    from mujoco_warp._src.adjoint import solver_implicit_adjoint
+
+    tape.record_func(
+      lambda m=m, d=d: solver_implicit_adjoint(m, d),
+      [d.qacc, d.qacc_smooth],
+    )
+
   sensor.sensor_acc(m, d)
   # TODO(team): mj_checkAcc
 
