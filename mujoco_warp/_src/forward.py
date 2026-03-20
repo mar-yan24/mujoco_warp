@@ -245,10 +245,11 @@ def _advance(m: Model, d: Data, qacc: wp.array, qvel: Optional[wp.array] = None)
   # TODO(team): can we assume static timesteps?
 
   # Clone arrays used as both input and output so that Warp's tape retains the
-  # original values for correct reverse-mode AD.
-  act_in = wp.clone(d.act)
-  qvel_prev = wp.clone(d.qvel)
-  qpos_prev = wp.clone(d.qpos)
+  # original values for correct reverse-mode AD.  Guard with requires_grad so
+  # non-AD paths pay zero overhead.
+  act_in = wp.clone(d.act) if d.act.requires_grad else d.act
+  qvel_prev = wp.clone(d.qvel) if d.qvel.requires_grad else d.qvel
+  qpos_prev = wp.clone(d.qpos) if d.qpos.requires_grad else d.qpos
 
   # advance activations
   wp.launch(
@@ -947,8 +948,13 @@ def fwd_actuation(m: Model, d: Data):
     ],
     outputs=[d.qfrc_actuator],
   )
-  # clone to break input/output aliasing for correct AD
-  qfrc_actuator_in = wp.clone(d.qfrc_actuator)
+  # clone to break input/output aliasing for correct AD; skip when not
+  # recording a backward tape to avoid unnecessary allocation + copy.
+  qfrc_actuator_in = (
+      wp.clone(d.qfrc_actuator)
+      if d.qfrc_actuator.requires_grad
+      else d.qfrc_actuator
+  )
   wp.launch(
     _qfrc_actuator_gravcomp_limits,
     dim=(d.nworld, m.nv),
@@ -1035,6 +1041,17 @@ def forward(m: Model, d: Data):
   fwd_acceleration(m, d, factorize=True)
 
   solver.solve(m, d)
+
+  # Record implicit differentiation adjoint on the active tape
+  tape = wp._src.context.runtime.tape
+  if tape is not None and d.qpos.requires_grad:
+    from mujoco_warp._src.adjoint import solver_implicit_adjoint
+
+    tape.record_func(
+      lambda m=m, d=d: solver_implicit_adjoint(m, d),
+      [d.qacc, d.qacc_smooth],
+    )
+
   sensor.sensor_acc(m, d)
 
 
@@ -1090,6 +1107,17 @@ def step2(m: Model, d: Data):
   fwd_actuation(m, d)
   fwd_acceleration(m, d)
   solver.solve(m, d)
+
+  # Record implicit differentiation adjoint on the active tape
+  tape = wp._src.context.runtime.tape
+  if tape is not None and d.qpos.requires_grad:
+    from mujoco_warp._src.adjoint import solver_implicit_adjoint
+
+    tape.record_func(
+      lambda m=m, d=d: solver_implicit_adjoint(m, d),
+      [d.qacc, d.qacc_smooth],
+    )
+
   sensor.sensor_acc(m, d)
   # TODO(team): mj_checkAcc
 
