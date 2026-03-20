@@ -1751,6 +1751,9 @@ class Data:
     njmax_pad: njmax rounded up to the nearest multiple of TILE_SIZE_JTDAJ
     nacon: number of detected contacts (across all worlds)      (1,)
     ncollision: collision count from broadphase                 (1,)
+    solver_h: solver retained Hessian for backward pass
+    solver_hfactor: solver retained factored Hessian for backward pass
+    solver_Jaref: solver retained Jacobian reference for backward pass
   """
 
   solver_niter: array("nworld", int)
