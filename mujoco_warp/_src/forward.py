@@ -28,6 +28,7 @@ from mujoco_warp._src import sensor
 from mujoco_warp._src import smooth
 from mujoco_warp._src import solver
 from mujoco_warp._src import util_misc
+from mujoco_warp._src.support import next_act
 from mujoco_warp._src.support import xfrc_accumulate
 from mujoco_warp._src.types import MJ_MINVAL
 from mujoco_warp._src.types import BiasType
@@ -129,37 +130,6 @@ def _next_velocity(
   qvel_out[worldid, dofid] = qvel_in[worldid, dofid] + qacc_scale_in * qacc_in[worldid, dofid] * timestep
 
 
-# TODO(team): kernel analyzer array slice?
-@wp.func
-def _next_act(
-  # Model:
-  opt_timestep: float,  # kernel_analyzer: ignore
-  actuator_dyntype: int,  # kernel_analyzer: ignore
-  actuator_dynprm: vec10f,  # kernel_analyzer: ignore
-  actuator_actrange: wp.vec2,  # kernel_analyzer: ignore
-  # Data In:
-  act_in: float,  # kernel_analyzer: ignore
-  act_dot_in: float,  # kernel_analyzer: ignore
-  # In:
-  act_dot_scale: float,
-  clamp: bool,
-) -> float:
-  # advance actuation
-  if actuator_dyntype == DynType.FILTEREXACT:
-    tau = wp.max(MJ_MINVAL, actuator_dynprm[0])
-    act = act_in + act_dot_scale * act_dot_in * tau * (1.0 - wp.exp(-opt_timestep / tau))
-  elif actuator_dyntype == DynType.USER:
-    return act_in
-  else:
-    act = act_in + act_dot_scale * act_dot_in * opt_timestep
-
-  # clamp to actrange
-  if clamp:
-    act = wp.clamp(act, actuator_actrange[0], actuator_actrange[1])
-
-  return act
-
-
 @wp.kernel
 def _next_activation(
   # Model:
@@ -186,7 +156,7 @@ def _next_activation(
   actadr = actuator_actadr[uid]
   actnum = actuator_actnum[uid]
   for j in range(actadr, actadr + actnum):
-    act = _next_act(
+    act = next_act(
       opt_timestep[opt_timestep_id],
       actuator_dyntype[uid],
       actuator_dynprm[actuator_dynprm_id, uid],
@@ -203,12 +173,16 @@ def _next_activation(
 def _next_time(
   # Model:
   opt_timestep: wp.array(dtype=float),
+  is_sparse: bool,
   # Data in:
   nefc_in: wp.array(dtype=int),
   time_in: wp.array(dtype=float),
+  efc_J_rownnz_in: wp.array2d(dtype=int),
+  efc_J_rowadr_in: wp.array2d(dtype=int),
   nworld_in: int,
   naconmax_in: int,
   njmax_in: int,
+  njmax_nnz_in: int,
   nacon_in: wp.array(dtype=int),
   ncollision_in: wp.array(dtype=int),
   # Data out:
@@ -220,6 +194,11 @@ def _next_time(
 
   if nefc > njmax_in:
     wp.printf("nefc overflow - please increase njmax to %u\n", nefc)
+  elif nefc > 0 and is_sparse:
+    efcid = wp.min(nefc, njmax_in) - 1
+    efc_nnz = efc_J_rowadr_in[worldid, efcid] + efc_J_rownnz_in[worldid, efcid]
+    if efc_nnz > njmax_nnz_in:
+      wp.printf("njmax_nnz overflow - please increase njmax_nnz to %u\n", efc_nnz)
 
   if worldid == 0:
     ncollision = ncollision_in[0]
@@ -283,7 +262,20 @@ def _advance(m: Model, d: Data, qacc: wp.array, qvel: Optional[wp.array] = None)
   wp.launch(
     _next_time,
     dim=d.nworld,
-    inputs=[m.opt.timestep, d.nefc, d.time, d.nworld, d.naconmax, d.njmax, d.nacon, d.ncollision],
+    inputs=[
+      m.opt.timestep,
+      m.is_sparse,
+      d.nefc,
+      d.time,
+      d.efc.J_rownnz,
+      d.efc.J_rowadr,
+      d.nworld,
+      d.naconmax,
+      d.njmax,
+      d.njmax_nnz,
+      d.nacon,
+      d.ncollision,
+    ],
     outputs=[d.time],
   )
 
@@ -616,7 +608,7 @@ def _tendon_velocity(
 @event_scope
 def fwd_velocity(m: Model, d: Data):
   """Velocity-dependent computations."""
-  wp.launch_tiled(
+  wp.launch(
     _actuator_velocity,
     dim=(d.nworld, m.nu),
     inputs=[d.qvel, d.moment_rownnz, d.moment_rowadr, d.moment_colind, d.actuator_moment],
@@ -707,7 +699,7 @@ def _actuator_force(
       if dyntype == DynType.INTEGRATOR or dyntype == DynType.NONE:
         act = act_in[worldid, act_last]
 
-      ctrl_act = _next_act(
+      ctrl_act = next_act(
         opt_timestep[worldid % opt_timestep.shape[0]],
         dyntype,
         dynprm,
