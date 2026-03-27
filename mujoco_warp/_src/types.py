@@ -1773,6 +1773,9 @@ class Data:
     njmax_nnz: number of non-zeros in constraint Jacobian
     nacon: number of detected contacts (across all worlds)      (1,)
     ncollision: collision count from broadphase                 (1,)
+    solver_h: solver retained Hessian for backward pass
+    solver_hfactor: solver retained factored Hessian for backward pass
+    solver_Jaref: solver retained Jacobian reference for backward pass
   """
 
   solver_niter: array("nworld", int)

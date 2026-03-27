@@ -18,6 +18,7 @@ from typing import Optional
 import warp as wp
 
 from mujoco_warp._src import collision_driver
+from mujoco_warp._src import collision_smooth
 from mujoco_warp._src import constraint
 from mujoco_warp._src import derivative
 from mujoco_warp._src import island
@@ -567,7 +568,15 @@ def fwd_position(m: Model, d: Data, factorize: bool = True):
     smooth.factor_m(m, d)
   if m.opt.run_collision_detection:
     collision_driver.collision(m, d)
+    # Phase 3: smooth collision recomputation for AD
+    tape = wp._src.context.runtime.tape
+    if tape is not None and d.qpos.requires_grad:
+      collision_smooth.smooth_recompute_contacts(m, d)
   constraint.make_constraint(m, d)
+  # Phase 3: differentiable constraint assembly for AD
+  tape = wp._src.context.runtime.tape
+  if tape is not None and d.qpos.requires_grad:
+    collision_smooth.smooth_contact_to_efc(m, d)
   # TODO(team): remove False after island features are more complete
   if False and not (m.opt.disableflags & DisableBit.ISLAND):
     island.island(m, d)
@@ -950,11 +959,7 @@ def fwd_actuation(m: Model, d: Data):
   )
   # clone to break input/output aliasing for correct AD; skip when not
   # recording a backward tape to avoid unnecessary allocation + copy.
-  qfrc_actuator_in = (
-      wp.clone(d.qfrc_actuator)
-      if d.qfrc_actuator.requires_grad
-      else d.qfrc_actuator
-  )
+  qfrc_actuator_in = wp.clone(d.qfrc_actuator) if d.qfrc_actuator.requires_grad else d.qfrc_actuator
   wp.launch(
     _qfrc_actuator_gravcomp_limits,
     dim=(d.nworld, m.nv),

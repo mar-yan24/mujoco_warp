@@ -93,9 +93,29 @@ SMOOTH_GRAD_FIELDS: tuple = (
   "sensordata",
 )
 
-SOLVER_GRAD_FIELDS: tuple = (
-  "qfrc_constraint",
+SOLVER_GRAD_FIELDS: tuple = ("qfrc_constraint",)
+
+COLLISION_GRAD_FIELDS: tuple = (
+  # Contact geometry (written by smooth_recompute_contacts)
+  "contact.dist",
+  "contact.pos",
+  "contact.frame",
+  # Constraint arrays (written by smooth_contact_to_efc)
+  "efc.J",
+  "efc.pos",
+  "efc.D",
+  "efc.aref",
+  "efc.vel",
 )
+
+
+def _resolve_field(d: Data, name: str):
+  """Resolve a field name, supporting dotted paths like 'contact.dist'."""
+  if "." in name:
+    obj_name, field_name = name.split(".", 1)
+    obj = getattr(d, obj_name, None)
+    return getattr(obj, field_name, None) if obj else None
+  return getattr(d, name, None)
 
 
 def enable_grad(d: Data, fields: Optional[Sequence[str]] = None) -> None:
@@ -103,7 +123,7 @@ def enable_grad(d: Data, fields: Optional[Sequence[str]] = None) -> None:
   if fields is None:
     fields = SMOOTH_GRAD_FIELDS
   for name in fields:
-    arr = getattr(d, name, None)
+    arr = _resolve_field(d, name)
     if arr is not None and isinstance(arr, wp.array):
       arr.requires_grad = True
 
@@ -111,7 +131,7 @@ def enable_grad(d: Data, fields: Optional[Sequence[str]] = None) -> None:
 def disable_grad(d: Data) -> None:
   """Disables gradient tracking on all Data arrays."""
   for name in SMOOTH_GRAD_FIELDS:
-    arr = getattr(d, name, None)
+    arr = _resolve_field(d, name)
     if arr is not None and isinstance(arr, wp.array):
       arr.requires_grad = False
 
@@ -132,8 +152,7 @@ def _warn_if_cg_solver(m: Model, d: Data):
   """Warn if CG solver is used with constraints (gradients will be zero)."""
   if d.njmax > 0 and m.opt.solver != SolverType.NEWTON:
     warnings.warn(
-      "Differentiable solver requires Newton. CG solver "
-      "gradients through constraints will be zero.",
+      "Differentiable solver requires Newton. CG solver gradients through constraints will be zero.",
       stacklevel=3,
     )
 

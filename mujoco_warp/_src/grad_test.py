@@ -20,6 +20,7 @@ from absl.testing import parameterized
 import mujoco_warp as mjw
 from mujoco_warp import test_data
 from mujoco_warp._src import math
+from mujoco_warp._src.grad import _resolve_field
 from mujoco_warp._src.grad import enable_grad
 
 # tolerance for AD vs finite-difference comparison
@@ -120,6 +121,31 @@ _SIMPLE_FREE_XML = """
 </mujoco>
 """
 
+# Freejoint root + hinge child with actuator, for full step gradient test.
+_FREE_HINGE_XML = """
+<mujoco>
+  <option gravity="0 0 -9.81" jacobian="sparse">
+    <flag contact="disable" constraint="disable"/>
+  </option>
+  <worldbody>
+    <body pos="0 0 1">
+      <joint name="root" type="free"/>
+      <geom type="sphere" size="0.1" mass="1"/>
+      <body pos="0 0 -0.5">
+        <joint name="j1" type="hinge" axis="0 1 0"/>
+        <geom type="sphere" size="0.1" mass="1"/>
+      </body>
+    </body>
+  </worldbody>
+  <actuator>
+    <motor joint="j1" gear="1"/>
+  </actuator>
+  <keyframe>
+    <key qpos="0 0 1 1 0 0 0 0.3" qvel="0.1 0 0 0 0.1 0 -0.2" ctrl="0.5"/>
+  </keyframe>
+</mujoco>
+"""
+
 
 def _fd_gradient(fn, x_np, eps=1e-3):
   """Central-difference gradient of scalar fn w.r.t. x_np."""
@@ -160,6 +186,7 @@ class GradSmoothTest(parameterized.TestCase):
   @parameterized.parameters(
     ("hinge", _SIMPLE_HINGE_XML),
     ("slide", _SIMPLE_SLIDE_XML),
+    ("free", _SIMPLE_FREE_XML),
   )
   def test_kinematics_grad(self, name, xml):
     """dL/dqpos through kinematics(): loss = sum(xpos)."""
@@ -366,6 +393,53 @@ class GradSmoothTest(parameterized.TestCase):
       atol=_FD_TOL,
       rtol=_FD_TOL,
       err_msg="euler step grad mismatch",
+    )
+
+  @absltest.skipIf(
+    wp.get_device().is_cuda and wp.get_device().arch < 70,
+    "tile kernels (cuSolverDx) require sm_70+",
+  )
+  def test_euler_step_grad_free(self):
+    """Full Euler step gradient for freejoint + hinge model: dL/dctrl."""
+    xml = _FREE_HINGE_XML
+    mjm, mjd, m, d = test_data.fixture(xml=xml, keyframe=0)
+    enable_grad(d)
+
+    loss = wp.zeros(1, dtype=float, requires_grad=True)
+    tape = wp.Tape()
+    with tape:
+      mjw.step(m, d)
+      wp.launch(
+        _sum_xpos_kernel,
+        dim=(d.nworld, m.nbody),
+        inputs=[d.xpos, loss],
+      )
+    tape.backward(loss=loss)
+    ad_grad = d.ctrl.grad.numpy()[0, : mjm.nu].copy()
+    tape.zero()
+
+    def eval_loss(ctrl_np):
+      _, _, _, d_fd = test_data.fixture(xml=xml, keyframe=0)
+      enable_grad(d_fd)
+      d_fd.ctrl = wp.array(ctrl_np.reshape(1, -1), dtype=float)
+      mjw.step(m, d_fd)
+      l = wp.zeros(1, dtype=float)
+      wp.launch(
+        _sum_xpos_kernel,
+        dim=(d_fd.nworld, m.nbody),
+        inputs=[d_fd.xpos, l],
+      )
+      return l.numpy()[0]
+
+    ctrl_np = mjd.ctrl.copy()
+    fd_grad = _fd_gradient(eval_loss, ctrl_np)
+
+    np.testing.assert_allclose(
+      ad_grad,
+      fd_grad,
+      atol=_FD_TOL,
+      rtol=_FD_TOL,
+      err_msg="euler step grad (freejoint+hinge) mismatch",
     )
 
 
@@ -812,6 +886,93 @@ class GradUtilTest(absltest.TestCase):
     self.assertTrue(d.xpos.requires_grad)
     self.assertFalse(d.qvel.requires_grad)
     self.assertFalse(d.ctrl.requires_grad)
+
+  def test_enable_backward_module_flags(self):
+    """Verify enable_backward is set correctly on all AD-relevant modules."""
+    from mujoco_warp._src import collision_smooth
+    from mujoco_warp._src import derivative
+    from mujoco_warp._src import forward as forward_mod
+    from mujoco_warp._src import passive
+    from mujoco_warp._src import smooth
+
+    # Modules that SHOULD have enable_backward=True
+    for mod in [smooth, forward_mod, passive, derivative, collision_smooth]:
+      opts = wp.get_module_options(mod)
+      self.assertTrue(
+        opts.get("enable_backward", False),
+        f"{mod.__name__} should have enable_backward=True",
+      )
+
+    # Modules that should NOT have enable_backward
+    from mujoco_warp._src import collision_driver
+    from mujoco_warp._src import constraint
+    from mujoco_warp._src import solver
+
+    for mod in [constraint, solver, collision_driver]:
+      opts = wp.get_module_options(mod)
+      self.assertFalse(
+        opts.get("enable_backward", False),
+        f"{mod.__name__} should have enable_backward=False",
+      )
+
+  def test_enable_grad_all_smooth_fields(self):
+    """All SMOOTH_GRAD_FIELDS are toggled by enable_grad."""
+    mjm = mujoco.MjModel.from_xml_string(_SIMPLE_HINGE_XML)
+    d = mjw.make_data(mjm)
+
+    mjw.enable_grad(d)
+    for name in mjw.SMOOTH_GRAD_FIELDS:
+      arr = _resolve_field(d, name)
+      if arr is not None and isinstance(arr, wp.array):
+        self.assertTrue(
+          arr.requires_grad,
+          f"SMOOTH_GRAD_FIELDS field '{name}' not enabled by enable_grad",
+        )
+
+    mjw.disable_grad(d)
+    for name in mjw.SMOOTH_GRAD_FIELDS:
+      arr = _resolve_field(d, name)
+      if arr is not None and isinstance(arr, wp.array):
+        self.assertFalse(
+          arr.requires_grad,
+          f"SMOOTH_GRAD_FIELDS field '{name}' not disabled by disable_grad",
+        )
+
+  def test_forward_without_grad_no_error(self):
+    """Forward pipeline without enable_grad works (no errors, no gradients)."""
+    mjm, mjd, m, d = test_data.fixture(xml=_SIMPLE_HINGE_XML, keyframe=0)
+    # Do NOT call enable_grad
+    mjw.kinematics(m, d)
+    mjw.com_pos(m, d)
+    mjw.crb(m, d)
+
+    # Verify no requires_grad is set
+    self.assertFalse(d.qpos.requires_grad)
+    self.assertFalse(d.xpos.requires_grad)
+
+  def test_diff_step_produces_nonzero_gradients(self):
+    """diff_step with enable_grad produces nonzero gradients."""
+    mjm, mjd, m, d = test_data.fixture(xml=_SIMPLE_HINGE_XML, keyframe=0)
+    enable_grad(d)
+
+    loss = wp.zeros(1, dtype=float, requires_grad=True)
+    tape = wp.Tape()
+    with tape:
+      mjw.kinematics(m, d)
+      mjw.com_pos(m, d)
+      wp.launch(
+        _sum_xpos_kernel,
+        dim=(d.nworld, m.nbody),
+        inputs=[d.xpos, loss],
+      )
+    tape.backward(loss=loss)
+
+    ad_grad = d.qpos.grad.numpy()[0, : mjm.nq]
+    # With a non-zero keyframe, kinematics gradients should be nonzero
+    self.assertTrue(
+      np.any(np.abs(ad_grad) > 1e-6),
+      "enable_grad + tape should produce nonzero gradients",
+    )
 
 
 if __name__ == "__main__":

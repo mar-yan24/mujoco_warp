@@ -15,6 +15,110 @@ from mujoco_warp._src.block_cholesky import create_blocked_cholesky_func
 from mujoco_warp._src.block_cholesky import create_blocked_cholesky_solve_func
 from mujoco_warp._src.warp_util import cache_kernel
 
+# ---------------------------------------------------------------------------
+# Phase 3: efc-level gradient kernels for collision chain
+# ---------------------------------------------------------------------------
+
+
+@wp.kernel
+def _efc_J_grad_kernel(
+  # In:
+  v: wp.array2d(dtype=float),
+  efc_force: wp.array2d(dtype=float),
+  nefc: wp.array(dtype=int),
+  nv: int,
+  njmax: int,
+  # Out:
+  efc_J_grad_out: wp.array3d(dtype=float),
+):
+  """Compute adj_efc_J[i, j] = v[j] * efc_force[i].
+
+  From KKT: F(qacc) = M*qacc - qfrc_smooth - J^T*f = 0
+  The derivative of J^T*f w.r.t. J[i,j] is f[i] * delta, and the
+  adjoint vector v gives the sensitivity: adj_J[i,j] = v[j] * f[i].
+  """
+  worldid, efcid, dofid = wp.tid()
+  if efcid < nefc[worldid] and dofid < nv:
+    efc_J_grad_out[worldid, efcid, dofid] = v[worldid, dofid] * efc_force[worldid, efcid]
+
+
+@wp.kernel
+def _efc_pos_grad_kernel(
+  # In:
+  efc_aref_grad: wp.array2d(dtype=float),
+  contact_solref: wp.array(dtype=wp.vec2),
+  contact_solimp: wp.array(dtype=types.vec5),
+  contact_includemargin: wp.array(dtype=float),
+  contact_dist: wp.array(dtype=float),
+  contact_efc_address: wp.array2d(dtype=int),
+  contact_worldid: wp.array(dtype=int),
+  contact_type: wp.array(dtype=int),
+  nacon: wp.array(dtype=int),
+  opt_timestep: wp.array(dtype=float),
+  opt_disableflags: int,
+  # Out:
+  efc_pos_grad_out: wp.array2d(dtype=float),
+):
+  """Compute adj_efc_pos from adj_efc_aref.
+
+  From efc_aref = -k * imp * pos - b * vel, d(aref)/d(pos) = -k*imp.
+  So adj_efc_pos = adj_efc_aref * (-k * imp).
+  We iterate over contacts and their first dimension (normal direction).
+  """
+  conid = wp.tid()
+  if conid >= nacon[0]:
+    return
+  if not (contact_type[conid] & 1):  # ContactType.CONSTRAINT
+    return
+
+  efcid = contact_efc_address[conid, 0]
+  if efcid < 0:
+    return
+
+  worldid = contact_worldid[conid]
+  timestep = opt_timestep[worldid % opt_timestep.shape[0]]
+
+  solref = contact_solref[conid]
+  solimp = contact_solimp[conid]
+  includemargin = contact_includemargin[conid]
+  pos_val = contact_dist[conid] - includemargin
+
+  # Recompute k and imp (same as _efc_row)
+  timeconst = solref[0]
+  dampratio = solref[1]
+  dmin = solimp[0]
+  dmax = solimp[1]
+  width = solimp[2]
+  mid = solimp[3]
+  power = solimp[4]
+
+  if not (opt_disableflags & types.DisableBit.REFSAFE):
+    timeconst = wp.max(timeconst, 2.0 * timestep)
+
+  dmin = wp.clamp(dmin, types.MJ_MINIMP, types.MJ_MAXIMP)
+  dmax = wp.clamp(dmax, types.MJ_MINIMP, types.MJ_MAXIMP)
+  width = wp.max(types.MJ_MINVAL, width)
+  mid = wp.clamp(mid, types.MJ_MINIMP, types.MJ_MAXIMP)
+  power = wp.max(1.0, power)
+
+  dmax_sq = dmax * dmax
+  k = 1.0 / (dmax_sq * timeconst * timeconst * dampratio * dampratio)
+  k = wp.where(solref[0] <= 0.0, -solref[0] / dmax_sq, k)
+
+  imp_x = wp.abs(pos_val) / width
+  imp_a = (1.0 / wp.pow(mid, power - 1.0)) * wp.pow(imp_x, power)
+  imp_b = 1.0 - (1.0 / wp.pow(1.0 - mid, power - 1.0)) * wp.pow(1.0 - imp_x, power)
+  imp_y = wp.where(imp_x < mid, imp_a, imp_b)
+  imp = dmin + imp_y * (dmax - dmin)
+  imp = wp.clamp(imp, dmin, dmax)
+  imp = wp.where(imp_x > 1.0, dmax, imp)
+
+  # d(aref)/d(pos) = -k * imp
+  daref_dpos = -k * imp
+
+  adj_aref = efc_aref_grad[worldid, efcid]
+  efc_pos_grad_out[worldid, efcid] = adj_aref * daref_dpos
+
 
 @wp.func_grad(math.quat_integrate)
 def _quat_integrate_grad(q: wp.quat, v: wp.vec3, dt: float, adj_ret: wp.quat):
@@ -182,9 +286,7 @@ def _adjoint_cholesky_full_blocked(tile_size: int, matrix_size: int):
     out: wp.array3d(dtype=float),
   ):
     worldid = wp.tid()
-    wp.static(create_blocked_cholesky_func(tile_size))(
-      H[worldid], nv_runtime, hfactor_tmp[worldid]
-    )
+    wp.static(create_blocked_cholesky_func(tile_size))(H[worldid], nv_runtime, hfactor_tmp[worldid])
     wp.static(create_blocked_cholesky_solve_func(tile_size, matrix_size))(
       hfactor_tmp[worldid], b[worldid], nv_runtime, out[worldid]
     )
@@ -219,9 +321,7 @@ def _solve_hessian_system(m: types.Model, d: types.Data, b, out):
     if d.solver_hfactor.shape[1] > 0:
       # Solve-only using stored Cholesky factor
       wp.launch_tiled(
-        _adjoint_cholesky_blocked(
-          types.TILE_SIZE_JTDAJ_DENSE, m.nv_pad
-        ),
+        _adjoint_cholesky_blocked(types.TILE_SIZE_JTDAJ_DENSE, m.nv_pad),
         dim=d.nworld,
         inputs=[d.solver_hfactor, b_3d, m.nv],
         outputs=[out_3d],
@@ -237,13 +337,9 @@ def _solve_hessian_system(m: types.Model, d: types.Data, b, out):
           inputs=[m.nv],
           outputs=[d.solver_h],
         )
-      hfactor_tmp = wp.zeros(
-        (d.nworld, m.nv_pad, m.nv_pad), dtype=float
-      )
+      hfactor_tmp = wp.zeros((d.nworld, m.nv_pad, m.nv_pad), dtype=float)
       wp.launch_tiled(
-        _adjoint_cholesky_full_blocked(
-          types.TILE_SIZE_JTDAJ_DENSE, m.nv_pad
-        ),
+        _adjoint_cholesky_full_blocked(types.TILE_SIZE_JTDAJ_DENSE, m.nv_pad),
         dim=d.nworld,
         inputs=[d.solver_h, b_3d, m.nv, hfactor_tmp],
         outputs=[out_3d],
@@ -287,3 +383,36 @@ def solver_implicit_adjoint(m: types.Model, d: types.Data):
 
   # adj_qacc_smooth = M * v
   support.mul_m(m, d, d.qacc_smooth.grad, v)
+
+  # Phase 3: compute efc-level gradients for collision chain
+  if d.njmax > 0:
+    efc_J = d.efc.J
+    if hasattr(efc_J, "grad") and efc_J.grad is not None:
+      wp.launch(
+        _efc_J_grad_kernel,
+        dim=(d.nworld, d.njmax_pad, m.nv_pad),
+        inputs=[v, d.efc.force, d.nefc, m.nv, d.njmax],
+        outputs=[efc_J.grad],
+      )
+
+    efc_aref = d.efc.aref
+    efc_pos = d.efc.pos
+    if hasattr(efc_aref, "grad") and efc_aref.grad is not None and hasattr(efc_pos, "grad") and efc_pos.grad is not None:
+      wp.launch(
+        _efc_pos_grad_kernel,
+        dim=d.naconmax,
+        inputs=[
+          efc_aref.grad,
+          d.contact.solref,
+          d.contact.solimp,
+          d.contact.includemargin,
+          d.contact.dist,
+          d.contact.efc_address,
+          d.contact.worldid,
+          d.contact.type,
+          d.nacon,
+          m.opt.timestep,
+          m.opt.disableflags,
+        ],
+        outputs=[efc_pos.grad],
+      )
