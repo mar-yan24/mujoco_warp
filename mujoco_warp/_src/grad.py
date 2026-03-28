@@ -93,9 +93,7 @@ SMOOTH_GRAD_FIELDS: tuple = (
   "sensordata",
 )
 
-SOLVER_GRAD_FIELDS: tuple = (
-  "qfrc_constraint",
-)
+SOLVER_GRAD_FIELDS: tuple = ("qfrc_constraint",)
 
 COLLISION_GRAD_FIELDS: tuple = (
   # Contact geometry (written by smooth_recompute_contacts)
@@ -113,8 +111,8 @@ COLLISION_GRAD_FIELDS: tuple = (
 
 def _resolve_field(d: Data, name: str):
   """Resolve a field name, supporting dotted paths like 'contact.dist'."""
-  if '.' in name:
-    obj_name, field_name = name.split('.', 1)
+  if "." in name:
+    obj_name, field_name = name.split(".", 1)
     obj = getattr(d, obj_name, None)
     return getattr(obj, field_name, None) if obj else None
   return getattr(d, name, None)
@@ -154,8 +152,7 @@ def _warn_if_cg_solver(m: Model, d: Data):
   """Warn if CG solver is used with constraints (gradients will be zero)."""
   if d.njmax > 0 and m.opt.solver != SolverType.NEWTON:
     warnings.warn(
-      "Differentiable solver requires Newton. CG solver "
-      "gradients through constraints will be zero.",
+      "Differentiable solver requires Newton. CG solver gradients through constraints will be zero.",
       stacklevel=3,
     )
 

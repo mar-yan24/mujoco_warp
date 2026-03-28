@@ -15,7 +15,6 @@ from mujoco_warp._src.block_cholesky import create_blocked_cholesky_func
 from mujoco_warp._src.block_cholesky import create_blocked_cholesky_solve_func
 from mujoco_warp._src.warp_util import cache_kernel
 
-
 # ---------------------------------------------------------------------------
 # Phase 3: efc-level gradient kernels for collision chain
 # ---------------------------------------------------------------------------
@@ -40,9 +39,7 @@ def _efc_J_grad_kernel(
   """
   worldid, efcid, dofid = wp.tid()
   if efcid < nefc[worldid] and dofid < nv:
-    efc_J_grad_out[worldid, efcid, dofid] = (
-      v[worldid, dofid] * efc_force[worldid, efcid]
-    )
+    efc_J_grad_out[worldid, efcid, dofid] = v[worldid, dofid] * efc_force[worldid, efcid]
 
 
 @wp.kernel
@@ -289,9 +286,7 @@ def _adjoint_cholesky_full_blocked(tile_size: int, matrix_size: int):
     out: wp.array3d(dtype=float),
   ):
     worldid = wp.tid()
-    wp.static(create_blocked_cholesky_func(tile_size))(
-      H[worldid], nv_runtime, hfactor_tmp[worldid]
-    )
+    wp.static(create_blocked_cholesky_func(tile_size))(H[worldid], nv_runtime, hfactor_tmp[worldid])
     wp.static(create_blocked_cholesky_solve_func(tile_size, matrix_size))(
       hfactor_tmp[worldid], b[worldid], nv_runtime, out[worldid]
     )
@@ -326,9 +321,7 @@ def _solve_hessian_system(m: types.Model, d: types.Data, b, out):
     if d.solver_hfactor.shape[1] > 0:
       # Solve-only using stored Cholesky factor
       wp.launch_tiled(
-        _adjoint_cholesky_blocked(
-          types.TILE_SIZE_JTDAJ_DENSE, m.nv_pad
-        ),
+        _adjoint_cholesky_blocked(types.TILE_SIZE_JTDAJ_DENSE, m.nv_pad),
         dim=d.nworld,
         inputs=[d.solver_hfactor, b_3d, m.nv],
         outputs=[out_3d],
@@ -344,13 +337,9 @@ def _solve_hessian_system(m: types.Model, d: types.Data, b, out):
           inputs=[m.nv],
           outputs=[d.solver_h],
         )
-      hfactor_tmp = wp.zeros(
-        (d.nworld, m.nv_pad, m.nv_pad), dtype=float
-      )
+      hfactor_tmp = wp.zeros((d.nworld, m.nv_pad, m.nv_pad), dtype=float)
       wp.launch_tiled(
-        _adjoint_cholesky_full_blocked(
-          types.TILE_SIZE_JTDAJ_DENSE, m.nv_pad
-        ),
+        _adjoint_cholesky_full_blocked(types.TILE_SIZE_JTDAJ_DENSE, m.nv_pad),
         dim=d.nworld,
         inputs=[d.solver_h, b_3d, m.nv, hfactor_tmp],
         outputs=[out_3d],
@@ -398,7 +387,7 @@ def solver_implicit_adjoint(m: types.Model, d: types.Data):
   # Phase 3: compute efc-level gradients for collision chain
   if d.njmax > 0:
     efc_J = d.efc.J
-    if hasattr(efc_J, 'grad') and efc_J.grad is not None:
+    if hasattr(efc_J, "grad") and efc_J.grad is not None:
       wp.launch(
         _efc_J_grad_kernel,
         dim=(d.nworld, d.njmax_pad, m.nv_pad),
@@ -408,10 +397,7 @@ def solver_implicit_adjoint(m: types.Model, d: types.Data):
 
     efc_aref = d.efc.aref
     efc_pos = d.efc.pos
-    if (
-      hasattr(efc_aref, 'grad') and efc_aref.grad is not None
-      and hasattr(efc_pos, 'grad') and efc_pos.grad is not None
-    ):
+    if hasattr(efc_aref, "grad") and efc_aref.grad is not None and hasattr(efc_pos, "grad") and efc_pos.grad is not None:
       wp.launch(
         _efc_pos_grad_kernel,
         dim=d.naconmax,

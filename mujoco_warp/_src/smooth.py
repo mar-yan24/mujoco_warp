@@ -168,7 +168,19 @@ def _kinematics_branch(
       # produces incorrect gradients in Warp's AD.
       if jntnum >= 1:
         xpos, xquat = _process_joint(
-          xpos, xquat, jntadr, jnt_pos_id, worldid, qpos0, jnt_type, jnt_qposadr, jnt_pos, jnt_axis, qpos, xanchor_out, xaxis_out
+          xpos,
+          xquat,
+          jntadr,
+          jnt_pos_id,
+          worldid,
+          qpos0,
+          jnt_type,
+          jnt_qposadr,
+          jnt_pos,
+          jnt_axis,
+          qpos,
+          xanchor_out,
+          xaxis_out,
         )
       if jntnum >= 2:
         xpos, xquat = _process_joint(

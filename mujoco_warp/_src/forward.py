@@ -929,11 +929,7 @@ def fwd_actuation(m: Model, d: Data):
   )
   # clone to break input/output aliasing for correct AD; skip when not
   # recording a backward tape to avoid unnecessary allocation + copy.
-  qfrc_actuator_in = (
-      wp.clone(d.qfrc_actuator)
-      if d.qfrc_actuator.requires_grad
-      else d.qfrc_actuator
-  )
+  qfrc_actuator_in = wp.clone(d.qfrc_actuator) if d.qfrc_actuator.requires_grad else d.qfrc_actuator
   wp.launch(
     _qfrc_actuator_gravcomp_limits,
     dim=(d.nworld, m.nv),

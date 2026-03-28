@@ -20,8 +20,8 @@ from absl.testing import parameterized
 import mujoco_warp as mjw
 from mujoco_warp import test_data
 from mujoco_warp._src import math
-from mujoco_warp._src.grad import enable_grad
 from mujoco_warp._src.grad import _resolve_field
+from mujoco_warp._src.grad import enable_grad
 
 # tolerance for AD vs finite-difference comparison
 _FD_TOL = 1e-3
@@ -889,11 +889,11 @@ class GradUtilTest(absltest.TestCase):
 
   def test_enable_backward_module_flags(self):
     """Verify enable_backward is set correctly on all AD-relevant modules."""
-    from mujoco_warp._src import smooth
+    from mujoco_warp._src import collision_smooth
+    from mujoco_warp._src import derivative
     from mujoco_warp._src import forward as forward_mod
     from mujoco_warp._src import passive
-    from mujoco_warp._src import derivative
-    from mujoco_warp._src import collision_smooth
+    from mujoco_warp._src import smooth
 
     # Modules that SHOULD have enable_backward=True
     for mod in [smooth, forward_mod, passive, derivative, collision_smooth]:
@@ -904,9 +904,9 @@ class GradUtilTest(absltest.TestCase):
       )
 
     # Modules that should NOT have enable_backward
+    from mujoco_warp._src import collision_driver
     from mujoco_warp._src import constraint
     from mujoco_warp._src import solver
-    from mujoco_warp._src import collision_driver
 
     for mod in [constraint, solver, collision_driver]:
       opts = wp.get_module_options(mod)

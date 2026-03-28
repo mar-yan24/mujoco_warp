@@ -33,9 +33,8 @@ import warp as wp
 
 from mujoco_warp._src import support
 from mujoco_warp._src import types
-from mujoco_warp._src.types import DisableBit
-from mujoco_warp._src.types import GeomType
 from mujoco_warp._src.types import MJ_MINVAL
+from mujoco_warp._src.types import DisableBit
 
 wp.set_module_options({"enable_backward": True})
 
@@ -43,6 +42,7 @@ wp.set_module_options({"enable_backward": True})
 # ============================================================================
 # Custom types (matching collision_primitive_core.py)
 # ============================================================================
+
 
 class mat23f(wp.types.matrix(shape=(2, 3), dtype=wp.float32)):
   pass
@@ -158,42 +158,32 @@ def smooth_capsule_capsule(
 
   vec1_np = cap1_pos + axis1 * x1_np
   vec2_np = cap2_pos + axis2 * x2_np
-  dist_np, pos_np, normal_np = smooth_sphere_sphere(
-    vec1_np, cap1_radius, vec2_np, cap2_radius
-  )
+  dist_np, pos_np, normal_np = smooth_sphere_sphere(vec1_np, cap1_radius, vec2_np, cap2_radius)
 
   # -- Parallel path: test 4 endpoint pairs, keep first 2 --
   # Endpoint 1: x1 = 1
   vec1_a = cap1_pos + axis1
   x2_a = wp.clamp((v - mb) / wp.max(mc, 1e-10), -1.0, 1.0)
   vec2_a = cap2_pos + axis2 * x2_a
-  dist_a, pos_a, normal_a = smooth_sphere_sphere(
-    vec1_a, cap1_radius, vec2_a, cap2_radius
-  )
+  dist_a, pos_a, normal_a = smooth_sphere_sphere(vec1_a, cap1_radius, vec2_a, cap2_radius)
 
   # Endpoint 2: x1 = -1
   vec1_b = cap1_pos - axis1
   x2_b = wp.clamp((v + mb) / wp.max(mc, 1e-10), -1.0, 1.0)
   vec2_b = cap2_pos + axis2 * x2_b
-  dist_b, pos_b, normal_b = smooth_sphere_sphere(
-    vec1_b, cap1_radius, vec2_b, cap2_radius
-  )
+  dist_b, pos_b, normal_b = smooth_sphere_sphere(vec1_b, cap1_radius, vec2_b, cap2_radius)
 
   # Endpoint 3: x2 = 1
   vec2_c = cap2_pos + axis2
   x1_c = wp.clamp((u - mb) / wp.max(ma, 1e-10), -1.0, 1.0)
   vec1_c = cap1_pos + axis1 * x1_c
-  dist_c, pos_c, normal_c = smooth_sphere_sphere(
-    vec1_c, cap1_radius, vec2_c, cap2_radius
-  )
+  dist_c, pos_c, normal_c = smooth_sphere_sphere(vec1_c, cap1_radius, vec2_c, cap2_radius)
 
   # Endpoint 4: x2 = -1
   vec2_d = cap2_pos - axis2
   x1_d = wp.clamp((u + mb) / wp.max(ma, 1e-10), -1.0, 1.0)
   vec1_d = cap1_pos + axis1 * x1_d
-  dist_d, pos_d, normal_d = smooth_sphere_sphere(
-    vec1_d, cap1_radius, vec2_d, cap2_radius
-  )
+  dist_d, pos_d, normal_d = smooth_sphere_sphere(vec1_d, cap1_radius, vec2_d, cap2_radius)
 
   # Sort 4 endpoints by distance, pick best 2 for parallel contacts
   # Contact 0: best of all 4
@@ -319,9 +309,15 @@ def smooth_make_frame(normal: wp.vec3) -> wp.mat33:
   c = wp.cross(a, b)
 
   return wp.mat33(
-    a[0], a[1], a[2],
-    b[0], b[1], b[2],
-    c[0], c[1], c[2],
+    a[0],
+    a[1],
+    a[2],
+    b[0],
+    b[1],
+    b[2],
+    c[0],
+    c[1],
+    c[2],
   )
 
 
@@ -406,9 +402,7 @@ def _smooth_recompute_kernel(
   # sphere-capsule
   if not handled and t1 == 2 and t2 == 3:
     cap_axis = wp.vec3(mat2[0, 2], mat2[1, 2], mat2[2, 2])
-    dist, pos, normal = smooth_sphere_capsule(
-      pos1, size1[0], pos2, cap_axis, size2[0], size2[1]
-    )
+    dist, pos, normal = smooth_sphere_capsule(pos1, size1[0], pos2, cap_axis, size2[0], size2[1])
     frame = smooth_make_frame(normal)
     contact_dist_out[cid] = dist
     contact_pos_out[cid] = pos
@@ -420,8 +414,14 @@ def _smooth_recompute_kernel(
     cap1_axis = wp.vec3(mat1[0, 2], mat1[1, 2], mat1[2, 2])
     cap2_axis = wp.vec3(mat2[0, 2], mat2[1, 2], mat2[2, 2])
     dists, positions, normals = smooth_capsule_capsule(
-      pos1, cap1_axis, size1[0], size1[1],
-      pos2, cap2_axis, size2[0], size2[1],
+      pos1,
+      cap1_axis,
+      size1[0],
+      size1[1],
+      pos2,
+      cap2_axis,
+      size2[0],
+      size2[1],
       1e10,  # large margin so we always compute both contacts
     )
     if subcid == 0:
@@ -440,9 +440,7 @@ def _smooth_recompute_kernel(
   if not handled and t1 == 0 and t2 == 3:
     plane_normal = wp.vec3(mat1[0, 2], mat1[1, 2], mat1[2, 2])
     cap_axis = wp.vec3(mat2[0, 2], mat2[1, 2], mat2[2, 2])
-    dists, positions, frame = smooth_plane_capsule(
-      plane_normal, pos1, pos2, cap_axis, size2[0], size2[1]
-    )
+    dists, positions, frame = smooth_plane_capsule(plane_normal, pos1, pos2, cap_axis, size2[0], size2[1])
     if subcid == 0:
       contact_dist_out[cid] = dists[0]
       contact_pos_out[cid] = wp.vec3(positions[0, 0], positions[0, 1], positions[0, 2])
@@ -628,14 +626,26 @@ def _smooth_contact_to_efc_kernel(
 
     if dofid == da:
       jac1p, jac1r = support.jac_dof(
-        body_parentid, body_rootid, dof_bodyid,
-        subtree_com_in, cdof_in,
-        con_pos, body1, dofid, worldid,
+        body_parentid,
+        body_rootid,
+        dof_bodyid,
+        subtree_com_in,
+        cdof_in,
+        con_pos,
+        body1,
+        dofid,
+        worldid,
       )
       jac2p, jac2r = support.jac_dof(
-        body_parentid, body_rootid, dof_bodyid,
-        subtree_com_in, cdof_in,
-        con_pos, body2, dofid, worldid,
+        body_parentid,
+        body_rootid,
+        dof_bodyid,
+        subtree_com_in,
+        cdof_in,
+        con_pos,
+        body2,
+        dofid,
+        worldid,
       )
 
       J = float(0.0)
