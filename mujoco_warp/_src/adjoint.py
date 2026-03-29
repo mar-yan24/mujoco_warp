@@ -6,6 +6,8 @@ implicit differentiation adjoint for the constraint solver.
 Import this module via ``grad.py`` dont import it directly
 """
 
+import os
+
 import warp as wp
 
 from mujoco_warp._src import math
@@ -233,6 +235,17 @@ def _copy_grad_kernel(
   dst[worldid, dofid] = src[worldid, dofid]
 
 
+@wp.kernel
+def _accumulate_grad_kernel(
+  # In:
+  src: wp.array2d(dtype=float),
+  # Out:
+  dst: wp.array2d(dtype=float),
+):
+  worldid, dofid = wp.tid()
+  dst[worldid, dofid] = dst[worldid, dofid] + src[worldid, dofid]
+
+
 @cache_kernel
 def _adjoint_cholesky_tile(nv: int):
   @wp.kernel(module="unique", enable_backward=False)
@@ -347,22 +360,42 @@ def _solve_hessian_system(m: types.Model, d: types.Data, b, out):
       )
 
 
-def solver_implicit_adjoint(m: types.Model, d: types.Data):
+def solver_implicit_adjoint(m: types.Model, d: types.Data, qacc_array=None):
   """Implicit differentiation adjoint for constraint solver.
 
-  Called during tape backward. Reads d.qacc.grad (set by downstream),
-  solves H*v = adj_qacc, writes d.qacc_smooth.grad = M*v.
+  Called during tape backward. Reads qacc_array.grad (set by downstream
+  integrator adjoint), solves H*v = adj_qacc, accumulates into
+  d.qacc_smooth.grad += M*v.
+
+  Args:
+    qacc_array: The array whose .grad contains the incoming adjoint.
+                Defaults to d.qacc when called from diff_forward().
+                Integrators pass their local qacc array when it differs
+                from d.qacc (e.g. euler with implicit damping).
   """
   nv = m.nv
   if nv == 0:
     return
 
+  if qacc_array is None:
+    qacc_array = d.qacc
+
+  adj_qacc = qacc_array.grad
+  if adj_qacc is None:
+    return
+
+  if os.environ.get("MJW_DEBUG_ADJOINT") == "1":
+    import torch
+
+    adj_norm = wp.to_torch(adj_qacc).norm().item()
+    print(f"[adjoint] |adj_qacc|={adj_norm:.6e}, njmax={d.njmax}")
+
   if d.njmax == 0:
-    # Solver was identity (qacc = qacc_smooth), copy adjoint through
+    # Solver was identity (qacc = qacc_smooth), accumulate adjoint through
     wp.launch(
-      _copy_grad_kernel,
+      _accumulate_grad_kernel,
       dim=(d.nworld, nv),
-      inputs=[d.qacc.grad],
+      inputs=[adj_qacc],
       outputs=[d.qacc_smooth.grad],
     )
     return
@@ -370,19 +403,26 @@ def solver_implicit_adjoint(m: types.Model, d: types.Data):
   if m.opt.solver != types.SolverType.NEWTON:
     # CG solver: no Hessian stored, fall back to identity
     wp.launch(
-      _copy_grad_kernel,
+      _accumulate_grad_kernel,
       dim=(d.nworld, nv),
-      inputs=[d.qacc.grad],
+      inputs=[adj_qacc],
       outputs=[d.qacc_smooth.grad],
     )
     return
 
   # Solve H * v = adj_qacc
   v = wp.zeros((d.nworld, m.nv_pad), dtype=float)
-  _solve_hessian_system(m, d, d.qacc.grad, v)
+  _solve_hessian_system(m, d, adj_qacc, v)
 
-  # adj_qacc_smooth = M * v
-  support.mul_m(m, d, d.qacc_smooth.grad, v)
+  # adj_qacc_smooth += M * v  (accumulate, not overwrite)
+  tmp = wp.zeros((d.nworld, m.nv_pad), dtype=float)
+  support.mul_m(m, d, tmp, v)
+  wp.launch(
+    _accumulate_grad_kernel,
+    dim=(d.nworld, nv),
+    inputs=[tmp],
+    outputs=[d.qacc_smooth.grad],
+  )
 
   # Phase 3: compute efc-level gradients for collision chain
   if d.njmax > 0:
