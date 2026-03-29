@@ -975,5 +975,200 @@ class GradUtilTest(absltest.TestCase):
     )
 
 
+# ---- Test models for integrator gradient path ----
+
+_HINGE_EULERDAMP_DISABLED_XML = """
+<mujoco>
+  <option gravity="0 0 -9.81" jacobian="sparse">
+    <flag contact="disable" constraint="disable" eulerdamp="disable"/>
+  </option>
+  <worldbody>
+    <body>
+      <joint name="j0" type="hinge" axis="0 1 0"/>
+      <geom type="sphere" size="0.1" mass="1"/>
+      <body pos="0 0 -0.5">
+        <joint name="j1" type="hinge" axis="0 1 0"/>
+        <geom type="sphere" size="0.1" mass="1"/>
+      </body>
+    </body>
+  </worldbody>
+  <actuator>
+    <motor joint="j0" gear="1"/>
+    <motor joint="j1" gear="1"/>
+  </actuator>
+  <keyframe>
+    <key qpos="0.5 -0.3" qvel="0.1 -0.2" ctrl="0.5 -0.5"/>
+  </keyframe>
+</mujoco>
+"""
+
+_HINGE_EULERDAMP_ENABLED_XML = """
+<mujoco>
+  <option gravity="0 0 -9.81" jacobian="sparse"/>
+  <worldbody>
+    <body>
+      <joint name="j0" type="hinge" axis="0 1 0" damping="1.0"/>
+      <geom type="sphere" size="0.1" mass="1"/>
+      <body pos="0 0 -0.5">
+        <joint name="j1" type="hinge" axis="0 1 0" damping="1.0"/>
+        <geom type="sphere" size="0.1" mass="1"/>
+      </body>
+    </body>
+  </worldbody>
+  <actuator>
+    <motor joint="j0" gear="1"/>
+    <motor joint="j1" gear="1"/>
+  </actuator>
+  <keyframe>
+    <key qpos="0.5 -0.3" qvel="0.1 -0.2" ctrl="0.5 -0.5"/>
+  </keyframe>
+</mujoco>
+"""
+
+
+class GradIntegratorTest(parameterized.TestCase):
+  """Tests that exercise the gradient path through the integrator.
+
+  Unlike test_euler_step_grad (which uses loss on xpos and bypasses the
+  integrator), these tests use loss on qpos after step(), verifying that
+  gradients flow through: ctrl -> actuation -> acceleration -> solver adjoint
+  -> integrator -> qpos.
+  """
+
+  @absltest.skipIf(
+    wp.get_device().is_cuda and wp.get_device().arch < 70,
+    "tile kernels (cuSolverDx) require sm_70+",
+  )
+  def test_euler_qpos_grad_no_eulerdamp(self):
+    """dL/dctrl through step() measured on qpos, eulerdamp disabled."""
+    xml = _HINGE_EULERDAMP_DISABLED_XML
+    mjm, mjd, m, d = test_data.fixture(xml=xml, keyframe=0)
+    enable_grad(d)
+
+    # AD gradient
+    loss = wp.zeros(1, dtype=float, requires_grad=True)
+    tape = wp.Tape()
+    with tape:
+      mjw.step(m, d)
+      wp.launch(
+        _sum_qpos_kernel,
+        dim=(d.nworld, mjm.nq),
+        inputs=[d.qpos, loss],
+      )
+    tape.backward(loss=loss)
+    ad_grad = d.ctrl.grad.numpy()[0, : mjm.nu].copy()
+    tape.zero()
+
+    # FD gradient
+    def eval_loss(ctrl_np):
+      _, _, _, d_fd = test_data.fixture(xml=xml, keyframe=0)
+      d_fd.ctrl = wp.array(ctrl_np.reshape(1, -1), dtype=float)
+      mjw.step(m, d_fd)
+      l = wp.zeros(1, dtype=float)
+      wp.launch(
+        _sum_qpos_kernel,
+        dim=(d_fd.nworld, mjm.nq),
+        inputs=[d_fd.qpos, l],
+      )
+      return l.numpy()[0]
+
+    ctrl_np = mjd.ctrl.copy()
+    fd_grad = _fd_gradient(eval_loss, ctrl_np, eps=1e-3)
+
+    self.assertTrue(
+      np.linalg.norm(ad_grad) > 1e-6,
+      f"AD gradient should be nonzero, got |grad|={np.linalg.norm(ad_grad):.3e}",
+    )
+    np.testing.assert_allclose(
+      ad_grad, fd_grad, atol=_FD_TOL, rtol=_FD_TOL,
+      err_msg="AD vs FD mismatch for dL(qpos)/dctrl (eulerdamp disabled)",
+    )
+
+  @absltest.skipIf(
+    wp.get_device().is_cuda and wp.get_device().arch < 70,
+    "tile kernels (cuSolverDx) require sm_70+",
+  )
+  def test_euler_qpos_grad_with_eulerdamp(self):
+    """dL/dctrl through step() measured on qpos, eulerdamp enabled."""
+    xml = _HINGE_EULERDAMP_ENABLED_XML
+    mjm, mjd, m, d = test_data.fixture(xml=xml, keyframe=0)
+    enable_grad(d)
+
+    # AD gradient
+    loss = wp.zeros(1, dtype=float, requires_grad=True)
+    tape = wp.Tape()
+    with tape:
+      mjw.step(m, d)
+      wp.launch(
+        _sum_qpos_kernel,
+        dim=(d.nworld, mjm.nq),
+        inputs=[d.qpos, loss],
+      )
+    tape.backward(loss=loss)
+    ad_grad = d.ctrl.grad.numpy()[0, : mjm.nu].copy()
+    tape.zero()
+
+    # FD gradient
+    def eval_loss(ctrl_np):
+      _, _, _, d_fd = test_data.fixture(xml=xml, keyframe=0)
+      d_fd.ctrl = wp.array(ctrl_np.reshape(1, -1), dtype=float)
+      mjw.step(m, d_fd)
+      l = wp.zeros(1, dtype=float)
+      wp.launch(
+        _sum_qpos_kernel,
+        dim=(d_fd.nworld, mjm.nq),
+        inputs=[d_fd.qpos, l],
+      )
+      return l.numpy()[0]
+
+    ctrl_np = mjd.ctrl.copy()
+    fd_grad = _fd_gradient(eval_loss, ctrl_np, eps=1e-3)
+
+    self.assertTrue(
+      np.linalg.norm(ad_grad) > 1e-6,
+      f"AD gradient should be nonzero, got |grad|={np.linalg.norm(ad_grad):.3e}",
+    )
+    np.testing.assert_allclose(
+      ad_grad, fd_grad, atol=_FD_TOL, rtol=_FD_TOL,
+      err_msg="AD vs FD mismatch for dL(qpos)/dctrl (eulerdamp enabled)",
+    )
+
+  @absltest.skipIf(
+    wp.get_device().is_cuda and wp.get_device().arch < 70,
+    "tile kernels (cuSolverDx) require sm_70+",
+  )
+  @absltest.skipIf(
+    wp.get_device().is_cuda and wp.get_device().arch < 70,
+    "tile kernels (cuSolverDx) require sm_70+",
+  )
+  def test_multistep_qpos_grad_nonzero(self):
+    """dL/dctrl through 2 steps produces nonzero gradient."""
+    xml = _HINGE_EULERDAMP_DISABLED_XML
+    mjm, mjd, m, d = test_data.fixture(xml=xml, keyframe=0)
+    enable_grad(d)
+
+    loss = wp.zeros(1, dtype=float, requires_grad=True)
+    tape = wp.Tape()
+    with tape:
+      mjw.step(m, d)
+      mjw.step(m, d)
+      wp.launch(
+        _sum_qpos_kernel,
+        dim=(d.nworld, mjm.nq),
+        inputs=[d.qpos, loss],
+      )
+    tape.backward(loss=loss)
+    ad_grad = d.ctrl.grad.numpy()[0, : mjm.nu].copy()
+    tape.zero()
+
+    # Multi-step AD vs FD accuracy is limited by shared-array accumulation
+    # across steps (a known Warp tape limitation). Here we just verify the
+    # gradient is nonzero — single-step FD accuracy is tested above.
+    self.assertTrue(
+      np.linalg.norm(ad_grad) > 1e-6,
+      f"Multi-step AD gradient should be nonzero, got |grad|={np.linalg.norm(ad_grad):.3e}",
+    )
+
+
 if __name__ == "__main__":
   absltest.main()
