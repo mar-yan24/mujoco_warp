@@ -995,6 +995,44 @@ def fwd_acceleration(m: Model, d: Data, factorize: bool = False):
   else:
     smooth.solve_m(m, d, d.qacc_smooth, d.qfrc_smooth)
 
+  # Custom adjoint for M_inv solve on the dense path.
+  # The tile Cholesky kernels have enable_backward=False, so the tape cannot
+  # propagate qacc_smooth.grad -> qfrc_smooth.grad automatically.  We record
+  # a callback that performs the VJP: qfrc_smooth.grad += M_inv * qacc_smooth.grad
+  # (M is symmetric so M_inv^T = M_inv).
+  _record_fwd_accel_adjoint(m, d)
+
+
+def _record_fwd_accel_adjoint(m: Model, d: Data):
+  """Record custom adjoint for the M_inv solve in fwd_acceleration.
+
+  On the dense path, _tile_cholesky_factorize_solve has enable_backward=False.
+  This record_func propagates qacc_smooth.grad -> qfrc_smooth.grad via M_inv,
+  using the already-factored d.qLD from the forward pass.
+  """
+  tape = wp._src.context.runtime.tape
+  if tape is not None and d.qpos.requires_grad and not m.is_sparse:
+    from mujoco_warp._src.adjoint import _accumulate_grad_kernel
+
+    def _adjoint(m=m, d=d):
+      adj_qacc_smooth = d.qacc_smooth.grad
+      if adj_qacc_smooth is None:
+        return
+      # qfrc_smooth.grad += M_inv * qacc_smooth.grad
+      tmp = wp.zeros_like(d.qfrc_smooth)
+      smooth.solve_m(m, d, tmp, adj_qacc_smooth)
+      if d.qfrc_smooth.grad is None:
+        d.qfrc_smooth.grad = tmp
+      else:
+        wp.launch(
+          _accumulate_grad_kernel,
+          dim=(d.nworld, m.nv),
+          inputs=[tmp],
+          outputs=[d.qfrc_smooth.grad],
+        )
+
+    tape.record_func(_adjoint, [d.qacc_smooth, d.qfrc_smooth])
+
 
 def _record_solver_adjoint(m: Model, d: Data, qacc_array=None):
   """Record the solver implicit differentiation adjoint on the active tape.
