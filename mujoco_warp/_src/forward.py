@@ -336,11 +336,12 @@ def euler(m: Model, d: Data):
   """Euler integrator, semi-implicit in velocity."""
   # integrate damping implicitly
   if not (m.opt.disableflags & (DisableBit.EULERDAMP | DisableBit.DAMPER)):
-    qacc = wp.empty((d.nworld, m.nv), dtype=float)
+    ad_active = d.qpos.requires_grad
+    qacc = wp.empty((d.nworld, m.nv), dtype=float, requires_grad=ad_active)
     if m.is_sparse:
       qM = wp.clone(d.qM)
-      qLD = wp.empty((d.nworld, 1, m.nC), dtype=float)
-      qLDiagInv = wp.empty((d.nworld, m.nv), dtype=float)
+      qLD = wp.empty((d.nworld, 1, m.nC), dtype=float, requires_grad=ad_active)
+      qLDiagInv = wp.empty((d.nworld, m.nv), dtype=float, requires_grad=ad_active)
       wp.launch(
         _euler_damp_qfrc_sparse,
         dim=(d.nworld, m.nv),
@@ -357,8 +358,10 @@ def euler(m: Model, d: Data):
           outputs=[qacc],
           block_dim=m.block_dim.euler_dense,
         )
+    _record_solver_adjoint(m, d, qacc_array=qacc)
     _advance(m, d, qacc)
   else:
+    _record_solver_adjoint(m, d, qacc_array=d.qacc)
     _advance(m, d, d.qacc)
 
 
@@ -469,14 +472,15 @@ def rungekutta4(m: Model, d: Data):
   A = [0.5, 0.5, 1.0]  # diagonal only
   B = [1.0 / 6.0, 1.0 / 3.0, 1.0 / 3.0, 1.0 / 6.0]
 
+  ad_active = d.qpos.requires_grad
   qpos_t0 = wp.clone(d.qpos)
   qvel_t0 = wp.clone(d.qvel)
-  qvel_rk = wp.zeros((d.nworld, m.nv), dtype=float)
-  qacc_rk = wp.zeros((d.nworld, m.nv), dtype=float)
+  qvel_rk = wp.zeros((d.nworld, m.nv), dtype=float, requires_grad=ad_active)
+  qacc_rk = wp.zeros((d.nworld, m.nv), dtype=float, requires_grad=ad_active)
 
   if m.na:
     act_t0 = wp.clone(d.act)
-    act_dot_rk = wp.zeros((d.nworld, m.na), dtype=float)
+    act_dot_rk = wp.zeros((d.nworld, m.na), dtype=float, requires_grad=ad_active)
   else:
     act_t0 = None
     act_dot_rk = None
@@ -496,6 +500,7 @@ def rungekutta4(m: Model, d: Data):
     wp.copy(d.act, act_t0)
     wp.copy(d.act_dot, act_dot_rk)
 
+  _record_solver_adjoint(m, d, qacc_array=qacc_rk)
   _advance(m, d, qacc_rk, qvel_rk)
 
 
@@ -503,6 +508,7 @@ def rungekutta4(m: Model, d: Data):
 def implicit(m: Model, d: Data):
   """Integrates fully implicit in velocity."""
   if ~(m.opt.disableflags | ~(DisableBit.ACTUATION | DisableBit.SPRING | DisableBit.DAMPER)):
+    ad_active = d.qpos.requires_grad
     if m.is_sparse:
       qDeriv = wp.empty((d.nworld, 1, m.nM), dtype=float)
       qLD = wp.empty((d.nworld, 1, m.nC), dtype=float)
@@ -511,10 +517,12 @@ def implicit(m: Model, d: Data):
       qLD = wp.empty(d.qM.shape, dtype=float)
     qLDiagInv = wp.empty((d.nworld, m.nv), dtype=float)
     derivative.deriv_smooth_vel(m, d, qDeriv)
-    qacc = wp.empty((d.nworld, m.nv), dtype=float)
+    qacc = wp.empty((d.nworld, m.nv), dtype=float, requires_grad=ad_active)
     smooth.factor_solve_i(m, d, qDeriv, qLD, qLDiagInv, qacc, d.efc.Ma)
+    _record_solver_adjoint(m, d, qacc_array=qacc)
     _advance(m, d, qacc)
   else:
+    _record_solver_adjoint(m, d, qacc_array=d.qacc)
     _advance(m, d, d.qacc)
 
 
@@ -988,9 +996,37 @@ def fwd_acceleration(m: Model, d: Data, factorize: bool = False):
     smooth.solve_m(m, d, d.qacc_smooth, d.qfrc_smooth)
 
 
+def _record_solver_adjoint(m: Model, d: Data, qacc_array=None):
+  """Record the solver implicit differentiation adjoint on the active tape.
+
+  Args:
+    qacc_array: The array whose .grad will receive the incoming adjoint from
+                the integrator backward. Defaults to d.qacc (correct when
+                the integrator uses d.qacc directly, e.g. eulerdamp disabled).
+                Integrators that create a local qacc must pass it here.
+  """
+  tape = wp._src.context.runtime.tape
+  if tape is not None and d.qpos.requires_grad:
+    from mujoco_warp._src.adjoint import solver_implicit_adjoint
+
+    if qacc_array is None:
+      qacc_array = d.qacc
+
+    tape.record_func(
+      lambda m=m, d=d, qa=qacc_array: solver_implicit_adjoint(m, d, qacc_array=qa),
+      [qacc_array, d.qacc_smooth],
+    )
+
+
 @event_scope
-def forward(m: Model, d: Data):
-  """Forward dynamics."""
+def forward(m: Model, d: Data, record_solver_adjoint: bool = True):
+  """Forward dynamics.
+
+  Args:
+    record_solver_adjoint: If True, record the solver implicit differentiation
+        adjoint on the tape. Set to False when called from step() since the
+        integrator records its own adjoint at the correct tape position.
+  """
   energy = m.opt.enableflags & EnableBit.ENERGY
 
   fwd_position(m, d, factorize=False)
@@ -1017,15 +1053,11 @@ def forward(m: Model, d: Data):
 
   solver.solve(m, d)
 
-  # Record implicit differentiation adjoint on the active tape
-  tape = wp._src.context.runtime.tape
-  if tape is not None and d.qpos.requires_grad:
-    from mujoco_warp._src.adjoint import solver_implicit_adjoint
-
-    tape.record_func(
-      lambda m=m, d=d: solver_implicit_adjoint(m, d),
-      [d.qacc, d.qacc_smooth],
-    )
+  # Record implicit differentiation adjoint on the active tape.
+  # When called from step(), the integrator handles this instead (at the
+  # correct tape position between factor_solve_i and _advance).
+  if record_solver_adjoint:
+    _record_solver_adjoint(m, d)
 
   sensor.sensor_acc(m, d)
 
@@ -1035,7 +1067,7 @@ def step(m: Model, d: Data):
   """Advance simulation."""
   # TODO(team): mj_checkPos
   # TODO(team): mj_checkVel
-  forward(m, d)
+  forward(m, d, record_solver_adjoint=False)
   # TODO(team): mj_checkAcc
 
   if m.opt.integrator == IntegratorType.EULER:
@@ -1083,15 +1115,8 @@ def step2(m: Model, d: Data):
   fwd_acceleration(m, d)
   solver.solve(m, d)
 
-  # Record implicit differentiation adjoint on the active tape
-  tape = wp._src.context.runtime.tape
-  if tape is not None and d.qpos.requires_grad:
-    from mujoco_warp._src.adjoint import solver_implicit_adjoint
-
-    tape.record_func(
-      lambda m=m, d=d: solver_implicit_adjoint(m, d),
-      [d.qacc, d.qacc_smooth],
-    )
+  # The solver adjoint record_func is handled by the integrator below,
+  # NOT here — see euler()/implicit() for details.
 
   sensor.sensor_acc(m, d)
   # TODO(team): mj_checkAcc
