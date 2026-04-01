@@ -1129,12 +1129,13 @@ def _isolate_intermediates_for_ad(m: Model, d: Data):
   to its own memory. The tape records operations on these unique arrays, and
   backward routes each substep's adjoint to the correct .grad memory.
 
-  Only called when AD is active (d.qpos.requires_grad). Cost is negligible:
-  ~25 KB/substep for the ant model (64 envs, 14 DOFs).
+  Only called when AD is active (d.qpos.requires_grad).
   """
   nw = d.nworld
   nv = m.nv
   nu = m.nu
+
+  # --- Force arrays ---
   d.qfrc_smooth = wp.zeros((nw, nv), dtype=float, requires_grad=True)
   d.qacc_smooth = wp.zeros((nw, nv), dtype=float, requires_grad=True)
   d.qfrc_actuator = wp.zeros((nw, nv), dtype=float, requires_grad=True)
@@ -1142,6 +1143,38 @@ def _isolate_intermediates_for_ad(m: Model, d: Data):
   d.qacc = wp.zeros((nw, nv), dtype=float, requires_grad=True)
   d.qfrc_bias = wp.zeros((nw, nv), dtype=float, requires_grad=True)
   d.qfrc_passive = wp.zeros((nw, nv), dtype=float, requires_grad=True)
+
+  # --- Kinematics arrays ---
+  # These use Warp vector/matrix dtypes (vec3, mat33, etc.) so use
+  # zeros_like to match the exact dtype and shape from the existing arrays.
+  d.xpos = wp.zeros_like(d.xpos, requires_grad=True)
+  d.xmat = wp.zeros_like(d.xmat, requires_grad=True)
+  d.xipos = wp.zeros_like(d.xipos, requires_grad=True)
+  d.ximat = wp.zeros_like(d.ximat, requires_grad=True)
+  d.subtree_com = wp.zeros_like(d.subtree_com, requires_grad=True)
+  d.cinert = wp.zeros_like(d.cinert, requires_grad=True)
+  d.cdof = wp.zeros_like(d.cdof, requires_grad=True)
+  d.cdof_dot = wp.zeros_like(d.cdof_dot, requires_grad=True)
+  d.cvel = wp.zeros_like(d.cvel, requires_grad=True)
+  d.crb = wp.zeros_like(d.crb, requires_grad=True)
+  d.cacc = wp.zeros_like(d.cacc, requires_grad=True)
+
+  # --- Mass matrix ---
+  # Shapes depend on sparse vs dense; zeros_like handles both.
+  d.qM = wp.zeros_like(d.qM, requires_grad=True)
+  d.qLD = wp.zeros_like(d.qLD, requires_grad=True)
+  d.qLDiagInv = wp.zeros((nw, nv), dtype=float, requires_grad=True)
+
+  # --- Geometry / joint kinematics ---
+  d.geom_xpos = wp.zeros_like(d.geom_xpos, requires_grad=True)
+  d.geom_xmat = wp.zeros_like(d.geom_xmat, requires_grad=True)
+  d.xanchor = wp.zeros_like(d.xanchor, requires_grad=True)
+  d.xaxis = wp.zeros_like(d.xaxis, requires_grad=True)
+  d.subtree_linvel = wp.zeros_like(d.subtree_linvel, requires_grad=True)
+  d.subtree_angmom = wp.zeros_like(d.subtree_angmom, requires_grad=True)
+
+  # --- Actuator arrays ---
+  d.actuator_velocity = wp.zeros((nw, nu), dtype=float, requires_grad=True)
 
 
 @event_scope
