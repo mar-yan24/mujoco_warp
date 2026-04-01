@@ -1009,29 +1009,37 @@ def _record_fwd_accel_adjoint(m: Model, d: Data):
   On the dense path, _tile_cholesky_factorize_solve has enable_backward=False.
   This record_func propagates qacc_smooth.grad -> qfrc_smooth.grad via M_inv,
   using the already-factored d.qLD from the forward pass.
+
+  Array references are captured at record time (not through d) so that
+  intermediate array cloning between substeps routes each substep's adjoint
+  to the correct .grad memory.
   """
   tape = wp._src.context.runtime.tape
   if tape is not None and d.qpos.requires_grad and not m.is_sparse:
     from mujoco_warp._src.adjoint import _accumulate_grad_kernel
 
-    def _adjoint(m=m, d=d):
-      adj_qacc_smooth = d.qacc_smooth.grad
+    # Capture current array refs for correct gradient isolation across substeps
+    qacc_smooth_ref = d.qacc_smooth
+    qfrc_smooth_ref = d.qfrc_smooth
+
+    def _adjoint(m=m, d=d, qacc_smooth=qacc_smooth_ref, qfrc_smooth=qfrc_smooth_ref):
+      adj_qacc_smooth = qacc_smooth.grad
       if adj_qacc_smooth is None:
         return
       # qfrc_smooth.grad += M_inv * qacc_smooth.grad
-      tmp = wp.zeros_like(d.qfrc_smooth)
+      tmp = wp.zeros_like(qfrc_smooth)
       smooth.solve_m(m, d, tmp, adj_qacc_smooth)
-      if d.qfrc_smooth.grad is None:
-        d.qfrc_smooth.grad = tmp
+      if qfrc_smooth.grad is None:
+        qfrc_smooth.grad = tmp
       else:
         wp.launch(
           _accumulate_grad_kernel,
           dim=(d.nworld, m.nv),
           inputs=[tmp],
-          outputs=[d.qfrc_smooth.grad],
+          outputs=[qfrc_smooth.grad],
         )
 
-    tape.record_func(_adjoint, [d.qacc_smooth, d.qfrc_smooth])
+    tape.record_func(_adjoint, [qacc_smooth_ref, qfrc_smooth_ref])
 
 
 def _record_solver_adjoint(m: Model, d: Data, qacc_array=None):
@@ -1042,6 +1050,9 @@ def _record_solver_adjoint(m: Model, d: Data, qacc_array=None):
                 the integrator backward. Defaults to d.qacc (correct when
                 the integrator uses d.qacc directly, e.g. eulerdamp disabled).
                 Integrators that create a local qacc must pass it here.
+
+  Array references are captured at record time so that intermediate array
+  cloning between substeps routes each substep's adjoint correctly.
   """
   tape = wp._src.context.runtime.tape
   if tape is not None and d.qpos.requires_grad:
@@ -1050,9 +1061,14 @@ def _record_solver_adjoint(m: Model, d: Data, qacc_array=None):
     if qacc_array is None:
       qacc_array = d.qacc
 
+    # Capture qacc_smooth ref at record time for gradient isolation
+    qacc_smooth_ref = d.qacc_smooth
+
     tape.record_func(
-      lambda m=m, d=d, qa=qacc_array: solver_implicit_adjoint(m, d, qacc_array=qa),
-      [qacc_array, d.qacc_smooth],
+      lambda m=m, d=d, qa=qacc_array, qs=qacc_smooth_ref: solver_implicit_adjoint(
+        m, d, qacc_array=qa, qacc_smooth_ref=qs
+      ),
+      [qacc_array, qacc_smooth_ref],
     )
 
 
@@ -1100,11 +1116,45 @@ def forward(m: Model, d: Data, record_solver_adjoint: bool = True):
   sensor.sensor_acc(m, d)
 
 
+def _isolate_intermediates_for_ad(m: Model, d: Data):
+  """Allocate fresh intermediate arrays for per-substep gradient isolation.
+
+  In tape-all mode (single wp.Tape over multiple step() calls), intermediate
+  arrays like qfrc_smooth and qacc_smooth are overwritten each substep but
+  share a single .grad array. This causes backward to accumulate adjoint
+  contributions from ALL substeps into the same memory (~250,000x amplification
+  for 16 substeps).
+
+  By allocating fresh arrays at the start of each step(), each substep writes
+  to its own memory. The tape records operations on these unique arrays, and
+  backward routes each substep's adjoint to the correct .grad memory.
+
+  Only called when AD is active (d.qpos.requires_grad). Cost is negligible:
+  ~25 KB/substep for the ant model (64 envs, 14 DOFs).
+  """
+  nw = d.nworld
+  nv = m.nv
+  nu = m.nu
+  d.qfrc_smooth = wp.zeros((nw, nv), dtype=float, requires_grad=True)
+  d.qacc_smooth = wp.zeros((nw, nv), dtype=float, requires_grad=True)
+  d.qfrc_actuator = wp.zeros((nw, nv), dtype=float, requires_grad=True)
+  d.actuator_force = wp.zeros((nw, nu), dtype=float, requires_grad=True)
+  d.qacc = wp.zeros((nw, nv), dtype=float, requires_grad=True)
+  d.qfrc_bias = wp.zeros((nw, nv), dtype=float, requires_grad=True)
+  d.qfrc_passive = wp.zeros((nw, nv), dtype=float, requires_grad=True)
+
+
 @event_scope
 def step(m: Model, d: Data):
   """Advance simulation."""
   # TODO(team): mj_checkPos
   # TODO(team): mj_checkVel
+
+  # Allocate fresh intermediate arrays when AD is active to prevent
+  # cross-substep gradient accumulation in tape-all mode.
+  if d.qpos.requires_grad:
+    _isolate_intermediates_for_ad(m, d)
+
   forward(m, d, record_solver_adjoint=False)
   # TODO(team): mj_checkAcc
 

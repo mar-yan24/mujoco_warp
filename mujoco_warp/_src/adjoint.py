@@ -360,18 +360,22 @@ def _solve_hessian_system(m: types.Model, d: types.Data, b, out):
       )
 
 
-def solver_implicit_adjoint(m: types.Model, d: types.Data, qacc_array=None):
+def solver_implicit_adjoint(m: types.Model, d: types.Data, qacc_array=None, qacc_smooth_ref=None):
   """Implicit differentiation adjoint for constraint solver.
 
   Called during tape backward. Reads qacc_array.grad (set by downstream
   integrator adjoint), solves H*v = adj_qacc, accumulates into
-  d.qacc_smooth.grad += M*v.
+  qacc_smooth_ref.grad += M*v.
 
   Args:
     qacc_array: The array whose .grad contains the incoming adjoint.
                 Defaults to d.qacc when called from diff_forward().
                 Integrators pass their local qacc array when it differs
                 from d.qacc (e.g. euler with implicit damping).
+    qacc_smooth_ref: The qacc_smooth array whose .grad receives the
+                     accumulated adjoint. Captured at record time for
+                     correct gradient isolation when intermediate arrays
+                     are cloned between substeps. Defaults to d.qacc_smooth.
   """
   nv = m.nv
   if nv == 0:
@@ -379,6 +383,9 @@ def solver_implicit_adjoint(m: types.Model, d: types.Data, qacc_array=None):
 
   if qacc_array is None:
     qacc_array = d.qacc
+
+  if qacc_smooth_ref is None:
+    qacc_smooth_ref = d.qacc_smooth
 
   adj_qacc = qacc_array.grad
   if adj_qacc is None:
@@ -396,7 +403,7 @@ def solver_implicit_adjoint(m: types.Model, d: types.Data, qacc_array=None):
       _accumulate_grad_kernel,
       dim=(d.nworld, nv),
       inputs=[adj_qacc],
-      outputs=[d.qacc_smooth.grad],
+      outputs=[qacc_smooth_ref.grad],
     )
     return
 
@@ -406,7 +413,7 @@ def solver_implicit_adjoint(m: types.Model, d: types.Data, qacc_array=None):
       _accumulate_grad_kernel,
       dim=(d.nworld, nv),
       inputs=[adj_qacc],
-      outputs=[d.qacc_smooth.grad],
+      outputs=[qacc_smooth_ref.grad],
     )
     return
 
@@ -421,7 +428,7 @@ def solver_implicit_adjoint(m: types.Model, d: types.Data, qacc_array=None):
     _accumulate_grad_kernel,
     dim=(d.nworld, nv),
     inputs=[tmp],
-    outputs=[d.qacc_smooth.grad],
+    outputs=[qacc_smooth_ref.grad],
   )
 
   # Phase 3: compute efc-level gradients for collision chain
