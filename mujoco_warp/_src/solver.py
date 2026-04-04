@@ -34,20 +34,6 @@ wp.set_module_options({"enable_backward": False})
 _BLOCK_CHOLESKY_DIM = 32
 
 
-# Copy kernel that is invisible to the tape (enable_backward=False).
-# Used instead of wp.copy() when a manual adjoint callback (e.g.
-# _record_solver_adjoint) already handles the backward path.  wp.copy is
-# a Warp built-in whose backward IS tracked regardless of module-level
-# enable_backward, causing double-counting with the manual adjoint.
-@wp.kernel(enable_backward=False)
-def _nograd_copy(
-    src: wp.array2d(dtype=float),
-    dst: wp.array2d(dtype=float),
-):
-  worldid, idx = wp.tid()
-  if idx < src.shape[1]:
-    dst[worldid, idx] = src[worldid, idx]
-
 
 @dataclasses.dataclass
 class InverseContext:
@@ -3333,7 +3319,7 @@ def init_context(m: types.Model, d: types.Data, ctx: SolverContext | InverseCont
 def solve(m: types.Model, d: types.Data):
   if d.njmax == 0 or m.nv == 0:
     wp.launch(
-      _nograd_copy, dim=(d.nworld, m.nv),
+      support._nograd_copy, dim=(d.nworld, m.nv),
       inputs=[d.qacc_smooth], outputs=[d.qacc],
     )
     d.solver_niter.fill_(0)
@@ -3346,12 +3332,12 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext):
   """Finds forces that satisfy constraints."""
   if not (m.opt.disableflags & types.DisableBit.WARMSTART):
     wp.launch(
-      _nograd_copy, dim=(d.nworld, m.nv),
+      support._nograd_copy, dim=(d.nworld, m.nv),
       inputs=[d.qacc_warmstart], outputs=[d.qacc],
     )
   else:
     wp.launch(
-      _nograd_copy, dim=(d.nworld, m.nv),
+      support._nograd_copy, dim=(d.nworld, m.nv),
       inputs=[d.qacc_smooth], outputs=[d.qacc],
     )
 

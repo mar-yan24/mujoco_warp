@@ -284,7 +284,7 @@ def _advance(m: Model, d: Data, qacc: wp.array, qvel: Optional[wp.array] = None)
   # wp.copy would be tracked on the tape and create cross-substep gradient
   # leaks through the shared d.qacc_warmstart array.
   wp.launch(
-    solver._nograd_copy, dim=(d.nworld, qacc.shape[1]),
+    support._nograd_copy, dim=(d.nworld, qacc.shape[1]),
     inputs=[qacc], outputs=[d.qacc_warmstart],
   )
 

@@ -41,18 +41,7 @@ from mujoco_warp._src.warp_util import event_scope
 wp.set_module_options({"enable_backward": True})
 
 
-# Copy kernel invisible to tape backward. Used in _solve_LD_sparse to
-# initialize the solve intermediate from qfrc_smooth without creating an
-# auto-AD gradient path. The manual _record_fwd_accel_adjoint callback
-# handles the qacc_smooth -> qfrc_smooth gradient path instead.
-@wp.kernel(enable_backward=False)
-def _nograd_copy_2d(
-    src: wp.array2d(dtype=float),
-    dst: wp.array2d(dtype=float),
-):
-  worldid, idx = wp.tid()
-  if idx < src.shape[1]:
-    dst[worldid, idx] = src[worldid, idx]
+_nograd_copy_2d = support._nograd_copy
 
 
 # kernel_analyzer: off
