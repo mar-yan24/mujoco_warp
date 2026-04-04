@@ -55,6 +55,7 @@ class mat23f(wp.types.matrix(shape=(2, 3), dtype=wp.float32)):
 
 @wp.func
 def smooth_plane_sphere(
+  # In:
   plane_normal: wp.vec3,
   plane_pos: wp.vec3,
   sphere_pos: wp.vec3,
@@ -68,6 +69,7 @@ def smooth_plane_sphere(
 
 @wp.func
 def smooth_sphere_sphere(
+  # In:
   pos1: wp.vec3,
   radius1: float,
   pos2: wp.vec3,
@@ -85,6 +87,7 @@ def smooth_sphere_sphere(
 
 @wp.func
 def smooth_sphere_capsule(
+  # In:
   sphere_pos: wp.vec3,
   sphere_radius: float,
   capsule_pos: wp.vec3,
@@ -107,6 +110,7 @@ def smooth_sphere_capsule(
 
 @wp.func
 def smooth_capsule_capsule(
+  # In:
   cap1_pos: wp.vec3,
   cap1_axis: wp.vec3,
   cap1_radius: float,
@@ -256,6 +260,7 @@ def smooth_capsule_capsule(
 
 @wp.func
 def smooth_plane_capsule(
+  # In:
   plane_normal: wp.vec3,
   plane_pos: wp.vec3,
   capsule_pos: wp.vec3,
@@ -328,19 +333,18 @@ def smooth_make_frame(normal: wp.vec3) -> wp.mat33:
 
 @wp.kernel
 def _smooth_recompute_kernel(
-  # Model (constants):
+  # Model:
   geom_type: wp.array(dtype=int),
-  geom_size: wp.array2d(dtype=wp.vec3),
   geom_bodyid: wp.array(dtype=int),
-  # Data in (differentiable):
+  geom_size: wp.array2d(dtype=wp.vec3),
+  # Data in:
   geom_xpos_in: wp.array2d(dtype=wp.vec3),
   geom_xmat_in: wp.array2d(dtype=wp.mat33),
-  # Data in (integer, no grad):
-  nacon_in: wp.array(dtype=int),
   contact_geom_in: wp.array(dtype=wp.vec2i),
-  contact_geomcollisionid_in: wp.array(dtype=int),
   contact_worldid_in: wp.array(dtype=int),
-  # Data out (differentiable):
+  contact_geomcollisionid_in: wp.array(dtype=int),
+  nacon_in: wp.array(dtype=int),
+  # Data out:
   contact_dist_out: wp.array(dtype=float),
   contact_pos_out: wp.array(dtype=wp.vec3),
   contact_frame_out: wp.array(dtype=wp.mat33),
@@ -460,11 +464,13 @@ def _smooth_recompute_kernel(
 
 @wp.func
 def compute_k_imp(
+  # Model:
+  opt_disableflags: int,
+  # In:
   solref: wp.vec2,
   solimp: types.vec5,
   pos: float,
   timestep: float,
-  opt_disableflags: int,
 ) -> wp.vec2:
   """Compute stiffness k and impedance imp from solref/solimp parameters.
 
@@ -510,7 +516,9 @@ def compute_k_imp(
 
 @wp.func
 def _smooth_efc_row(
+  # Model:
   opt_disableflags: int,
+  # In:
   worldid: int,
   timestep: float,
   efcid: int,
@@ -528,7 +536,7 @@ def _smooth_efc_row(
   vel_out: wp.array2d(dtype=float),
 ):
   """Smooth reimplementation of _efc_row for differentiable constraint params."""
-  k_imp = compute_k_imp(solref, solimp, pos_imp, timestep, opt_disableflags)
+  k_imp = compute_k_imp(opt_disableflags, solref, solimp, pos_imp, timestep)
   k = k_imp[0]
   imp = k_imp[1]
 
@@ -548,7 +556,7 @@ def _smooth_efc_row(
 
 @wp.kernel
 def _smooth_contact_to_efc_kernel(
-  # Model constants:
+  # Model:
   nv: int,
   opt_timestep: wp.array(dtype=float),
   opt_disableflags: int,
@@ -562,31 +570,30 @@ def _smooth_contact_to_efc_kernel(
   dof_bodyid: wp.array(dtype=int),
   dof_parentid: wp.array(dtype=int),
   geom_bodyid: wp.array(dtype=int),
-  # Data in (differentiable):
+  # Data in:
+  qvel_in: wp.array2d(dtype=float),
   subtree_com_in: wp.array2d(dtype=wp.vec3),
   cdof_in: wp.array2d(dtype=wp.spatial_vector),
-  qvel_in: wp.array2d(dtype=float),
   contact_dist_in: wp.array(dtype=float),
   contact_pos_in: wp.array(dtype=wp.vec3),
   contact_frame_in: wp.array(dtype=wp.mat33),
-  contact_friction_in: wp.array(dtype=types.vec5),
   contact_includemargin_in: wp.array(dtype=float),
+  contact_friction_in: wp.array(dtype=types.vec5),
   contact_solref_in: wp.array(dtype=wp.vec2),
   contact_solimp_in: wp.array(dtype=types.vec5),
-  # Data in (integer, no grad):
-  nacon_in: wp.array(dtype=int),
-  contact_efc_address_in: wp.array2d(dtype=int),
   contact_dim_in: wp.array(dtype=int),
-  contact_worldid_in: wp.array(dtype=int),
   contact_geom_in: wp.array(dtype=wp.vec2i),
+  contact_efc_address_in: wp.array2d(dtype=int),
+  contact_worldid_in: wp.array(dtype=int),
   contact_type_in: wp.array(dtype=int),
   njmax_in: int,
-  # Data out (differentiable):
+  nacon_in: wp.array(dtype=int),
+  # Data out:
   efc_J_out: wp.array3d(dtype=float),
   efc_pos_out: wp.array2d(dtype=float),
   efc_D_out: wp.array2d(dtype=float),
-  efc_aref_out: wp.array2d(dtype=float),
   efc_vel_out: wp.array2d(dtype=float),
+  efc_aref_out: wp.array2d(dtype=float),
 ):
   conid, dimid = wp.tid()
 
@@ -746,18 +753,17 @@ def smooth_recompute_contacts(m: types.Model, d: types.Data):
     _smooth_recompute_kernel,
     dim=d.naconmax,
     inputs=[
-      # Model constants
+      # Model
       m.geom_type,
-      m.geom_size,
       m.geom_bodyid,
-      # Data in (differentiable)
+      m.geom_size,
+      # Data in
       d.geom_xpos,
       d.geom_xmat,
-      # Data in (integer)
-      d.nacon,
       d.contact.geom,
-      d.contact.geomcollisionid,
       d.contact.worldid,
+      d.contact.geomcollisionid,
+      d.nacon,
     ],
     outputs=[
       d.contact.dist,
@@ -776,7 +782,7 @@ def smooth_contact_to_efc(m: types.Model, d: types.Data):
     _smooth_contact_to_efc_kernel,
     dim=(d.naconmax, m.nmaxpyramid),
     inputs=[
-      # Model constants
+      # Model
       m.nv,
       m.opt.timestep,
       m.opt.disableflags,
@@ -790,31 +796,30 @@ def smooth_contact_to_efc(m: types.Model, d: types.Data):
       m.dof_bodyid,
       m.dof_parentid,
       m.geom_bodyid,
-      # Data in (differentiable)
+      # Data in
+      d.qvel,
       d.subtree_com,
       d.cdof,
-      d.qvel,
       d.contact.dist,
       d.contact.pos,
       d.contact.frame,
-      d.contact.friction,
       d.contact.includemargin,
+      d.contact.friction,
       d.contact.solref,
       d.contact.solimp,
-      # Data in (integer)
-      d.nacon,
-      d.contact.efc_address,
       d.contact.dim,
-      d.contact.worldid,
       d.contact.geom,
+      d.contact.efc_address,
+      d.contact.worldid,
       d.contact.type,
       d.njmax,
+      d.nacon,
     ],
     outputs=[
       d.efc.J,
       d.efc.pos,
       d.efc.D,
-      d.efc.aref,
       d.efc.vel,
+      d.efc.aref,
     ],
   )

@@ -995,9 +995,7 @@ def make_data(
   _alloc_h = mjm.opt.solver == mujoco.mjtSolver.mjSOL_NEWTON
   _alloc_hfactor = _alloc_h and mjm.nv > 32  # _BLOCK_CHOLESKY_DIM
   d.solver_h = (
-    wp.zeros((nworld, sizes["nv_pad"], sizes["nv_pad"]), dtype=float)
-    if _alloc_h
-    else wp.empty((nworld, 0, 0), dtype=float)
+    wp.zeros((nworld, sizes["nv_pad"], sizes["nv_pad"]), dtype=float) if _alloc_h else wp.empty((nworld, 0, 0), dtype=float)
   )
   d.solver_hfactor = (
     wp.zeros((nworld, sizes["nv_pad"], sizes["nv_pad"]), dtype=float)
@@ -1238,9 +1236,7 @@ def put_data(
   _alloc_h = mjm.opt.solver == mujoco.mjtSolver.mjSOL_NEWTON
   _alloc_hfactor = _alloc_h and mjm.nv > 32  # _BLOCK_CHOLESKY_DIM
   d.solver_h = (
-    wp.zeros((nworld, sizes["nv_pad"], sizes["nv_pad"]), dtype=float)
-    if _alloc_h
-    else wp.empty((nworld, 0, 0), dtype=float)
+    wp.zeros((nworld, sizes["nv_pad"], sizes["nv_pad"]), dtype=float) if _alloc_h else wp.empty((nworld, 0, 0), dtype=float)
   )
   d.solver_hfactor = (
     wp.zeros((nworld, sizes["nv_pad"], sizes["nv_pad"]), dtype=float)

@@ -606,7 +606,9 @@ _CONTACT_FD_TOL = 1e-2
 
 @wp.kernel
 def _sum_qpos_kernel(
+  # Data in:
   qpos_in: wp.array2d(dtype=float),
+  # In:
   loss: wp.array(dtype=float),
 ):
   worldid, qid = wp.tid()

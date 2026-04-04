@@ -25,12 +25,14 @@ from mujoco_warp._src.warp_util import cache_kernel
 
 @wp.kernel
 def _efc_J_grad_kernel(
-  # In:
-  v: wp.array2d(dtype=float),
-  efc_force: wp.array2d(dtype=float),
-  nefc: wp.array(dtype=int),
+  # Model:
   nv: int,
-  njmax: int,
+  # Data in:
+  nefc_in: wp.array(dtype=int),
+  efc_force_in: wp.array2d(dtype=float),
+  njmax_in: int,
+  # In:
+  v_in: wp.array2d(dtype=float),
   # Out:
   efc_J_grad_out: wp.array3d(dtype=float),
 ):
@@ -41,24 +43,26 @@ def _efc_J_grad_kernel(
   adjoint vector v gives the sensitivity: adj_J[i,j] = v[j] * f[i].
   """
   worldid, efcid, dofid = wp.tid()
-  if efcid < nefc[worldid] and dofid < nv:
-    efc_J_grad_out[worldid, efcid, dofid] = v[worldid, dofid] * efc_force[worldid, efcid]
+  if efcid < nefc_in[worldid] and dofid < nv:
+    efc_J_grad_out[worldid, efcid, dofid] = v_in[worldid, dofid] * efc_force_in[worldid, efcid]
 
 
 @wp.kernel
 def _efc_pos_grad_kernel(
-  # In:
-  efc_aref_grad: wp.array2d(dtype=float),
-  contact_solref: wp.array(dtype=wp.vec2),
-  contact_solimp: wp.array(dtype=types.vec5),
-  contact_includemargin: wp.array(dtype=float),
-  contact_dist: wp.array(dtype=float),
-  contact_efc_address: wp.array2d(dtype=int),
-  contact_worldid: wp.array(dtype=int),
-  contact_type: wp.array(dtype=int),
-  nacon: wp.array(dtype=int),
+  # Model:
   opt_timestep: wp.array(dtype=float),
   opt_disableflags: int,
+  # Data in:
+  contact_dist_in: wp.array(dtype=float),
+  contact_includemargin_in: wp.array(dtype=float),
+  contact_solref_in: wp.array(dtype=wp.vec2),
+  contact_solimp_in: wp.array(dtype=types.vec5),
+  contact_efc_address_in: wp.array2d(dtype=int),
+  contact_worldid_in: wp.array(dtype=int),
+  contact_type_in: wp.array(dtype=int),
+  nacon_in: wp.array(dtype=int),
+  # In:
+  efc_aref_grad_in: wp.array2d(dtype=float),
   # Out:
   efc_pos_grad_out: wp.array2d(dtype=float),
 ):
@@ -69,29 +73,29 @@ def _efc_pos_grad_kernel(
   We iterate over contacts and their first dimension (normal direction).
   """
   conid = wp.tid()
-  if conid >= nacon[0]:
+  if conid >= nacon_in[0]:
     return
-  if not (contact_type[conid] & 1):  # ContactType.CONSTRAINT
+  if not (contact_type_in[conid] & 1):  # ContactType.CONSTRAINT
     return
 
-  efcid = contact_efc_address[conid, 0]
+  efcid = contact_efc_address_in[conid, 0]
   if efcid < 0:
     return
 
-  worldid = contact_worldid[conid]
+  worldid = contact_worldid_in[conid]
   timestep = opt_timestep[worldid % opt_timestep.shape[0]]
 
-  solref = contact_solref[conid]
-  solimp = contact_solimp[conid]
-  includemargin = contact_includemargin[conid]
-  pos_val = contact_dist[conid] - includemargin
+  solref = contact_solref_in[conid]
+  solimp = contact_solimp_in[conid]
+  includemargin = contact_includemargin_in[conid]
+  pos_val = contact_dist_in[conid] - includemargin
 
-  k_imp = compute_k_imp(solref, solimp, pos_val, timestep, opt_disableflags)
+  k_imp = compute_k_imp(opt_disableflags, solref, solimp, pos_val, timestep)
 
   # d(aref)/d(pos) = -k * imp
   daref_dpos = -k_imp[0] * k_imp[1]
 
-  adj_aref = efc_aref_grad[worldid, efcid]
+  adj_aref = efc_aref_grad_in[worldid, efcid]
   efc_pos_grad_out[worldid, efcid] = adj_aref * daref_dpos
 
 
@@ -202,10 +206,10 @@ def _copy_grad_kernel(
   # In:
   src: wp.array2d(dtype=float),
   # Out:
-  dst: wp.array2d(dtype=float),
+  dst_out: wp.array2d(dtype=float),
 ):
   worldid, dofid = wp.tid()
-  dst[worldid, dofid] = src[worldid, dofid]
+  dst_out[worldid, dofid] = src[worldid, dofid]
 
 
 @wp.kernel
@@ -213,10 +217,10 @@ def _accumulate_grad_kernel(
   # In:
   src: wp.array2d(dtype=float),
   # Out:
-  dst: wp.array2d(dtype=float),
+  dst_out: wp.array2d(dtype=float),
 ):
   worldid, dofid = wp.tid()
-  dst[worldid, dofid] = dst[worldid, dofid] + src[worldid, dofid]
+  dst_out[worldid, dofid] = dst_out[worldid, dofid] + src[worldid, dofid]
 
 
 @cache_kernel
@@ -282,7 +286,9 @@ def _adjoint_cholesky_full_blocked(tile_size: int, matrix_size: int):
 
 @wp.kernel
 def _padding_h_adjoint(
+  # Model:
   nv: int,
+  # Out:
   H_out: wp.array3d(dtype=float),
 ):
   worldid, elementid = wp.tid()
@@ -413,7 +419,7 @@ def solver_implicit_adjoint(m: types.Model, d: types.Data, qacc_array=None, qacc
       wp.launch(
         _efc_J_grad_kernel,
         dim=(d.nworld, d.njmax_pad, m.nv_pad),
-        inputs=[v, d.efc.force, d.nefc, m.nv, d.njmax],
+        inputs=[m.nv, d.nefc, d.efc.force, d.njmax, v],
         outputs=[efc_J.grad],
       )
 
@@ -424,17 +430,17 @@ def solver_implicit_adjoint(m: types.Model, d: types.Data, qacc_array=None, qacc
         _efc_pos_grad_kernel,
         dim=d.naconmax,
         inputs=[
-          efc_aref.grad,
+          m.opt.timestep,
+          m.opt.disableflags,
+          d.contact.dist,
+          d.contact.includemargin,
           d.contact.solref,
           d.contact.solimp,
-          d.contact.includemargin,
-          d.contact.dist,
           d.contact.efc_address,
           d.contact.worldid,
           d.contact.type,
           d.nacon,
-          m.opt.timestep,
-          m.opt.disableflags,
+          efc_aref.grad,
         ],
         outputs=[efc_pos.grad],
       )

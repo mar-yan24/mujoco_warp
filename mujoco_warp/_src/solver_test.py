@@ -677,7 +677,7 @@ class SolverTest(parameterized.TestCase):
     qacc = d.qacc.numpy()[0]
 
     # Verify Jaref = efc_J @ qacc - efc_aref
-    if SPARSE_CONSTRAINT_JACOBIAN:
+    if m.is_sparse:
       efc_J_raw = d.efc.J.numpy()[0, 0]
       colind = d.efc.J_colind.numpy()[0, 0]
       rownnz = d.efc.J_rownnz.numpy()[0]
