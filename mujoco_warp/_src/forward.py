@@ -1071,6 +1071,8 @@ def _record_solver_adjoint(m: Model, d: Data, qacc_array=None):
   """Record the solver implicit differentiation adjoint on the active tape.
 
   Args:
+    m: Model containing static simulation parameters.
+    d: Data containing mutable simulation state.
     qacc_array: The array whose .grad will receive the incoming adjoint from
                 the integrator backward. Defaults to d.qacc (correct when
                 the integrator uses d.qacc directly, e.g. eulerdamp disabled).
@@ -1163,6 +1165,8 @@ def forward(m: Model, d: Data, record_solver_adjoint: bool = True):
   """Forward dynamics.
 
   Args:
+    m: Model containing static simulation parameters.
+    d: Data containing mutable simulation state.
     record_solver_adjoint: If True, record the solver implicit differentiation
         adjoint on the tape. Set to False when called from step() since the
         integrator records its own adjoint at the correct tape position.

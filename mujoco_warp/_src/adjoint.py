@@ -341,6 +341,8 @@ def solver_implicit_adjoint(m: types.Model, d: types.Data, qacc_array=None, qacc
   qacc_smooth_ref.grad += M*v.
 
   Args:
+    m: Model containing static simulation parameters.
+    d: Data containing mutable simulation state.
     qacc_array: The array whose .grad contains the incoming adjoint.
                 Defaults to d.qacc when called from diff_forward().
                 Integrators pass their local qacc array when it differs
