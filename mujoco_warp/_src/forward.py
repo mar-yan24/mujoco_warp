@@ -27,6 +27,7 @@ from mujoco_warp._src import passive
 from mujoco_warp._src import sensor
 from mujoco_warp._src import smooth
 from mujoco_warp._src import solver
+from mujoco_warp._src import support
 from mujoco_warp._src import util_misc
 from mujoco_warp._src.support import next_act
 from mujoco_warp._src.support import xfrc_accumulate
@@ -304,6 +305,20 @@ def _euler_damp_qfrc_sparse(
   qM_integration_out[worldid, 0, adr] += timestep * dof_damping[worldid % dof_damping.shape[0], tid]
 
 
+@wp.kernel
+def _euler_damp_qfrc_dense(
+  # Model:
+  opt_timestep: wp.array(dtype=float),
+  dof_damping: wp.array2d(dtype=float),
+  # Out:
+  qM_integration_out: wp.array3d(dtype=float),
+):
+  """Add dt * damping to diagonal of dense (nworld, nv, nv) mass matrix."""
+  worldid, tid = wp.tid()
+  timestep = opt_timestep[worldid % opt_timestep.shape[0]]
+  qM_integration_out[worldid, tid, tid] += timestep * dof_damping[worldid % dof_damping.shape[0], tid]
+
+
 @cache_kernel
 def _tile_euler_dense(tile: TileSet):
   @wp.kernel(module="unique", enable_backward=False)
@@ -365,6 +380,7 @@ def euler(m: Model, d: Data):
           block_dim=m.block_dim.euler_dense,
         )
     _record_solver_adjoint(m, d, qacc_array=qacc)
+    _record_euler_damp_adjoint(m, d, qacc)
     _advance(m, d, qacc)
   else:
     _record_solver_adjoint(m, d, qacc_array=d.qacc)
@@ -1077,6 +1093,69 @@ def _record_solver_adjoint(m: Model, d: Data, qacc_array=None):
       ),
       [qacc_array, qacc_smooth_ref],
     )
+
+
+def _record_euler_damp_adjoint(m: Model, d: Data, qacc: wp.array):
+  """Record euler-damping adjoint transformation on the active tape.
+
+  During backward, transforms qacc.grad from the raw integrator adjoint
+  into the correct adjoint that accounts for the (M+dt*D)^{-1}*M
+  transformation in the euler implicit damping solve.
+
+  Forward:  qacc_local = (M + dt*D)^{-1} * M * d.qacc
+  Adjoint:  adj_d_qacc = M * (M + dt*D)^{-1} * adj_qacc_local
+
+  This callback runs between _advance backward (which sets qacc.grad)
+  and _record_solver_adjoint backward (which reads qacc.grad).
+  """
+  tape = wp._src.context.runtime.tape
+  if tape is None or not d.qpos.requires_grad:
+    return
+
+  # Capture the forward-pass mass matrix reference at record time.
+  # _isolate_intermediates_for_ad() allocates fresh d.qM each substep,
+  # so this captures the correct per-substep mass matrix.
+  qM_ref = d.qM
+  qacc_ref = qacc
+
+  def _adjoint(m=m, d=d, qM=qM_ref, qacc_arr=qacc_ref):
+    adj_qacc = qacc_arr.grad
+    if adj_qacc is None:
+      return
+
+    nv = m.nv
+
+    # Step 1: Construct M_damp = M + dt*D
+    qM_damp = wp.clone(qM)
+    if m.is_sparse:
+      wp.launch(
+        _euler_damp_qfrc_sparse,
+        dim=(d.nworld, nv),
+        inputs=[m.opt.timestep, m.dof_Madr, m.dof_damping],
+        outputs=[qM_damp],
+      )
+    else:
+      wp.launch(
+        _euler_damp_qfrc_dense,
+        dim=(d.nworld, nv),
+        inputs=[m.opt.timestep, m.dof_damping],
+        outputs=[qM_damp],
+      )
+
+    # Step 2: Solve (M + dt*D) * tmp = adj_qacc
+    qLD_tmp = wp.zeros_like(d.qLD)
+    qLDiagInv_tmp = wp.zeros((d.nworld, nv), dtype=float)
+    tmp = wp.zeros((d.nworld, nv), dtype=float)
+    smooth.factor_solve_i(m, d, qM_damp, qLD_tmp, qLDiagInv_tmp, tmp, adj_qacc)
+
+    # Step 3: result = M * tmp (using original undamped mass matrix)
+    result = wp.zeros((d.nworld, nv), dtype=float)
+    support.mul_m(m, d, result, tmp, M=qM)
+
+    # Step 4: Overwrite qacc.grad with the corrected adjoint
+    wp.copy(qacc_arr.grad, result)
+
+  tape.record_func(_adjoint, [qacc_ref])
 
 
 @event_scope

@@ -1170,5 +1170,132 @@ class GradIntegratorTest(parameterized.TestCase):
     )
 
 
+_HINGE_EULERDAMP_HIGH_DAMPING_SPARSE_XML = """
+<mujoco>
+  <option gravity="0 0 -9.81" jacobian="sparse"/>
+  <worldbody>
+    <body>
+      <joint name="j0" type="hinge" axis="0 1 0" damping="100.0"/>
+      <geom type="sphere" size="0.1" mass="1"/>
+      <body pos="0 0 -0.5">
+        <joint name="j1" type="hinge" axis="0 1 0" damping="100.0"/>
+        <geom type="sphere" size="0.1" mass="1"/>
+      </body>
+    </body>
+  </worldbody>
+  <actuator>
+    <motor joint="j0" gear="1"/>
+    <motor joint="j1" gear="1"/>
+  </actuator>
+  <keyframe>
+    <key qpos="0.5 -0.3" qvel="0.1 -0.2" ctrl="0.5 -0.5"/>
+  </keyframe>
+</mujoco>
+"""
+
+_HINGE_EULERDAMP_HIGH_DAMPING_DENSE_XML = """
+<mujoco>
+  <option gravity="0 0 -9.81" jacobian="dense"/>
+  <worldbody>
+    <body>
+      <joint name="j0" type="hinge" axis="0 1 0" damping="100.0"/>
+      <geom type="sphere" size="0.1" mass="1"/>
+      <body pos="0 0 -0.5">
+        <joint name="j1" type="hinge" axis="0 1 0" damping="100.0"/>
+        <geom type="sphere" size="0.1" mass="1"/>
+      </body>
+    </body>
+  </worldbody>
+  <actuator>
+    <motor joint="j0" gear="1"/>
+    <motor joint="j1" gear="1"/>
+  </actuator>
+  <keyframe>
+    <key qpos="0.5 -0.3" qvel="0.1 -0.2" ctrl="0.5 -0.5"/>
+  </keyframe>
+</mujoco>
+"""
+
+_HINGE_EULERDAMP_ENABLED_DENSE_XML = """
+<mujoco>
+  <option gravity="0 0 -9.81" jacobian="dense"/>
+  <worldbody>
+    <body>
+      <joint name="j0" type="hinge" axis="0 1 0" damping="1.0"/>
+      <geom type="sphere" size="0.1" mass="1"/>
+      <body pos="0 0 -0.5">
+        <joint name="j1" type="hinge" axis="0 1 0" damping="1.0"/>
+        <geom type="sphere" size="0.1" mass="1"/>
+      </body>
+    </body>
+  </worldbody>
+  <actuator>
+    <motor joint="j0" gear="1"/>
+    <motor joint="j1" gear="1"/>
+  </actuator>
+  <keyframe>
+    <key qpos="0.5 -0.3" qvel="0.1 -0.2" ctrl="0.5 -0.5"/>
+  </keyframe>
+</mujoco>
+"""
+
+
+class GradEulerDampStressTest(parameterized.TestCase):
+  """Stress tests for the euler damping adjoint with high damping and dense jacobian."""
+
+  @absltest.skipIf(
+    wp.get_device().is_cuda and wp.get_device().arch < 70,
+    "tile kernels (cuSolverDx) require sm_70+",
+  )
+  @parameterized.named_parameters(
+    ("high_damp_sparse", _HINGE_EULERDAMP_HIGH_DAMPING_SPARSE_XML),
+    ("high_damp_dense", _HINGE_EULERDAMP_HIGH_DAMPING_DENSE_XML),
+    ("normal_damp_dense", _HINGE_EULERDAMP_ENABLED_DENSE_XML),
+  )
+  def test_euler_damp_adjoint(self, xml):
+    """dL/dctrl through step() with eulerdamp enabled, AD matches FD."""
+    mjm, mjd, m, d = test_data.fixture(xml=xml, keyframe=0)
+    enable_grad(d)
+
+    # AD gradient
+    loss = wp.zeros(1, dtype=float, requires_grad=True)
+    tape = wp.Tape()
+    with tape:
+      mjw.step(m, d)
+      wp.launch(
+        _sum_qpos_kernel,
+        dim=(d.nworld, mjm.nq),
+        inputs=[d.qpos, loss],
+      )
+    tape.backward(loss=loss)
+    ad_grad = d.ctrl.grad.numpy()[0, : mjm.nu].copy()
+    tape.zero()
+
+    # FD gradient
+    def eval_loss(ctrl_np):
+      _, _, _, d_fd = test_data.fixture(xml=xml, keyframe=0)
+      d_fd.ctrl = wp.array(ctrl_np.reshape(1, -1), dtype=float)
+      mjw.step(m, d_fd)
+      l = wp.zeros(1, dtype=float)
+      wp.launch(
+        _sum_qpos_kernel,
+        dim=(d_fd.nworld, mjm.nq),
+        inputs=[d_fd.qpos, l],
+      )
+      return l.numpy()[0]
+
+    ctrl_np = mjd.ctrl.copy()
+    fd_grad = _fd_gradient(eval_loss, ctrl_np, eps=1e-3)
+
+    self.assertTrue(
+      np.linalg.norm(ad_grad) > 1e-6,
+      f"AD gradient should be nonzero, got |grad|={np.linalg.norm(ad_grad):.3e}",
+    )
+    np.testing.assert_allclose(
+      ad_grad, fd_grad, atol=_FD_TOL, rtol=_FD_TOL,
+      err_msg=f"AD vs FD mismatch for euler damp adjoint",
+    )
+
+
 if __name__ == "__main__":
   absltest.main()
