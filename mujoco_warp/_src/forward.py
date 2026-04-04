@@ -1216,6 +1216,11 @@ def _isolate_intermediates_for_ad(m: Model, d: Data):
   backward routes each substep's adjoint to the correct .grad memory.
 
   Only called when AD is active (d.qpos.requires_grad).
+
+  Every array here appears as an output of wp.launch in the pipeline. If
+  shared across substeps, Warp's adjoint zeroes the output .grad during
+  the later substep's backward, corrupting the earlier substep's gradient
+  chain.  The allocation overhead is ~25KB/step (negligible for GPU).
   """
   nw = d.nworld
   nv = m.nv
