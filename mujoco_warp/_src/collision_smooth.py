@@ -454,6 +454,56 @@ def _smooth_recompute_kernel(
 
 
 # ============================================================================
+# Shared constraint parameter computation
+# ============================================================================
+
+
+@wp.func
+def compute_k_imp(
+  solref: wp.vec2,
+  solimp: types.vec5,
+  pos: float,
+  timestep: float,
+  opt_disableflags: int,
+) -> wp.vec2:
+  """Compute stiffness k and impedance imp from solref/solimp parameters.
+
+  Returns (k, imp) packed as a vec2. Used by both the forward constraint
+  assembly and the adjoint gradient kernel.
+  """
+  timeconst = solref[0]
+  dampratio = solref[1]
+  dmin = solimp[0]
+  dmax = solimp[1]
+  width = solimp[2]
+  mid = solimp[3]
+  power = solimp[4]
+
+  if not (opt_disableflags & DisableBit.REFSAFE):
+    timeconst = wp.max(timeconst, 2.0 * timestep)
+
+  dmin = wp.clamp(dmin, types.MJ_MINIMP, types.MJ_MAXIMP)
+  dmax = wp.clamp(dmax, types.MJ_MINIMP, types.MJ_MAXIMP)
+  width = wp.max(MJ_MINVAL, width)
+  mid = wp.clamp(mid, types.MJ_MINIMP, types.MJ_MAXIMP)
+  power = wp.max(1.0, power)
+
+  dmax_sq = dmax * dmax
+  k = 1.0 / (dmax_sq * timeconst * timeconst * dampratio * dampratio)
+  k = wp.where(solref[0] <= 0.0, -solref[0] / dmax_sq, k)
+
+  imp_x = wp.abs(pos) / width
+  imp_a = (1.0 / wp.pow(mid, power - 1.0)) * wp.pow(imp_x, power)
+  imp_b = 1.0 - (1.0 / wp.pow(1.0 - mid, power - 1.0)) * wp.pow(1.0 - imp_x, power)
+  imp_y = wp.where(imp_x < mid, imp_a, imp_b)
+  imp = dmin + imp_y * (dmax - dmin)
+  imp = wp.clamp(imp, dmin, dmax)
+  imp = wp.where(imp_x > 1.0, dmax, imp)
+
+  return wp.vec2(k, imp)
+
+
+# ============================================================================
 # Differentiable constraint assembly kernel
 # ============================================================================
 
@@ -478,36 +528,17 @@ def _smooth_efc_row(
   vel_out: wp.array2d(dtype=float),
 ):
   """Smooth reimplementation of _efc_row for differentiable constraint params."""
-  timeconst = solref[0]
-  dampratio = solref[1]
-  dmin = solimp[0]
-  dmax = solimp[1]
-  width = solimp[2]
-  mid = solimp[3]
-  power = solimp[4]
+  k_imp = compute_k_imp(solref, solimp, pos_imp, timestep, opt_disableflags)
+  k = k_imp[0]
+  imp = k_imp[1]
 
+  # Damping coefficient (not shared — only needed by forward, not adjoint)
+  dmax = wp.clamp(solimp[1], types.MJ_MINIMP, types.MJ_MAXIMP)
+  timeconst = solref[0]
   if not (opt_disableflags & DisableBit.REFSAFE):
     timeconst = wp.max(timeconst, 2.0 * timestep)
-
-  dmin = wp.clamp(dmin, types.MJ_MINIMP, types.MJ_MAXIMP)
-  dmax = wp.clamp(dmax, types.MJ_MINIMP, types.MJ_MAXIMP)
-  width = wp.max(MJ_MINVAL, width)
-  mid = wp.clamp(mid, types.MJ_MINIMP, types.MJ_MAXIMP)
-  power = wp.max(1.0, power)
-
-  dmax_sq = dmax * dmax
-  k = 1.0 / (dmax_sq * timeconst * timeconst * dampratio * dampratio)
   b = 2.0 / (dmax * timeconst)
-  k = wp.where(solref[0] <= 0.0, -solref[0] / dmax_sq, k)
   b = wp.where(solref[1] <= 0.0, -solref[1] / dmax, b)
-
-  imp_x = wp.abs(pos_imp) / width
-  imp_a = (1.0 / wp.pow(mid, power - 1.0)) * wp.pow(imp_x, power)
-  imp_b = 1.0 - (1.0 / wp.pow(1.0 - mid, power - 1.0)) * wp.pow(1.0 - imp_x, power)
-  imp_y = wp.where(imp_x < mid, imp_a, imp_b)
-  imp = dmin + imp_y * (dmax - dmin)
-  imp = wp.clamp(imp, dmin, dmax)
-  imp = wp.where(imp_x > 1.0, dmax, imp)
 
   D_out[worldid, efcid] = 1.0 / wp.max(invweight * (1.0 - imp) / imp, MJ_MINVAL)
   vel_out[worldid, efcid] = vel

@@ -13,6 +13,7 @@ import warp as wp
 from mujoco_warp._src import math
 from mujoco_warp._src import support
 from mujoco_warp._src import types
+from mujoco_warp._src.collision_smooth import compute_k_imp
 from mujoco_warp._src.block_cholesky import create_blocked_cholesky_func
 from mujoco_warp._src.block_cholesky import create_blocked_cholesky_solve_func
 from mujoco_warp._src.warp_util import cache_kernel
@@ -85,38 +86,10 @@ def _efc_pos_grad_kernel(
   includemargin = contact_includemargin[conid]
   pos_val = contact_dist[conid] - includemargin
 
-  # Recompute k and imp (same as _efc_row)
-  timeconst = solref[0]
-  dampratio = solref[1]
-  dmin = solimp[0]
-  dmax = solimp[1]
-  width = solimp[2]
-  mid = solimp[3]
-  power = solimp[4]
-
-  if not (opt_disableflags & types.DisableBit.REFSAFE):
-    timeconst = wp.max(timeconst, 2.0 * timestep)
-
-  dmin = wp.clamp(dmin, types.MJ_MINIMP, types.MJ_MAXIMP)
-  dmax = wp.clamp(dmax, types.MJ_MINIMP, types.MJ_MAXIMP)
-  width = wp.max(types.MJ_MINVAL, width)
-  mid = wp.clamp(mid, types.MJ_MINIMP, types.MJ_MAXIMP)
-  power = wp.max(1.0, power)
-
-  dmax_sq = dmax * dmax
-  k = 1.0 / (dmax_sq * timeconst * timeconst * dampratio * dampratio)
-  k = wp.where(solref[0] <= 0.0, -solref[0] / dmax_sq, k)
-
-  imp_x = wp.abs(pos_val) / width
-  imp_a = (1.0 / wp.pow(mid, power - 1.0)) * wp.pow(imp_x, power)
-  imp_b = 1.0 - (1.0 / wp.pow(1.0 - mid, power - 1.0)) * wp.pow(1.0 - imp_x, power)
-  imp_y = wp.where(imp_x < mid, imp_a, imp_b)
-  imp = dmin + imp_y * (dmax - dmin)
-  imp = wp.clamp(imp, dmin, dmax)
-  imp = wp.where(imp_x > 1.0, dmax, imp)
+  k_imp = compute_k_imp(solref, solimp, pos_val, timestep, opt_disableflags)
 
   # d(aref)/d(pos) = -k * imp
-  daref_dpos = -k * imp
+  daref_dpos = -k_imp[0] * k_imp[1]
 
   adj_aref = efc_aref_grad[worldid, efcid]
   efc_pos_grad_out[worldid, efcid] = adj_aref * daref_dpos
