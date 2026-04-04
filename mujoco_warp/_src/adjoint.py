@@ -365,9 +365,9 @@ def solver_implicit_adjoint(m: types.Model, d: types.Data, qacc_array=None, qacc
     return
 
   if os.environ.get("MJW_DEBUG_ADJOINT") == "1":
-    import torch
+    import numpy as np
 
-    adj_norm = wp.to_torch(adj_qacc).norm().item()
+    adj_norm = np.linalg.norm(adj_qacc.numpy())
     print(f"[adjoint] |adj_qacc|={adj_norm:.6e}, njmax={d.njmax}")
 
   if d.njmax == 0:

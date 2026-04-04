@@ -1137,10 +1137,6 @@ class GradIntegratorTest(parameterized.TestCase):
     wp.get_device().is_cuda and wp.get_device().arch < 70,
     "tile kernels (cuSolverDx) require sm_70+",
   )
-  @absltest.skipIf(
-    wp.get_device().is_cuda and wp.get_device().arch < 70,
-    "tile kernels (cuSolverDx) require sm_70+",
-  )
   def test_multistep_qpos_grad_nonzero(self):
     """dL/dctrl through 2 steps produces nonzero gradient."""
     xml = _HINGE_EULERDAMP_DISABLED_XML
