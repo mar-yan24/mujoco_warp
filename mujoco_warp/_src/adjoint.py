@@ -13,9 +13,9 @@ import warp as wp
 from mujoco_warp._src import math
 from mujoco_warp._src import support
 from mujoco_warp._src import types
-from mujoco_warp._src.collision_smooth import compute_k_imp
 from mujoco_warp._src.block_cholesky import create_blocked_cholesky_func
 from mujoco_warp._src.block_cholesky import create_blocked_cholesky_solve_func
+from mujoco_warp._src.collision_smooth import compute_k_imp
 from mujoco_warp._src.warp_util import cache_kernel
 
 # ---------------------------------------------------------------------------

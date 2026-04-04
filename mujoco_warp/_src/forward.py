@@ -284,8 +284,10 @@ def _advance(m: Model, d: Data, qacc: wp.array, qvel: Optional[wp.array] = None)
   # wp.copy would be tracked on the tape and create cross-substep gradient
   # leaks through the shared d.qacc_warmstart array.
   wp.launch(
-    support._nograd_copy, dim=(d.nworld, qacc.shape[1]),
-    inputs=[qacc], outputs=[d.qacc_warmstart],
+    support._nograd_copy,
+    dim=(d.nworld, qacc.shape[1]),
+    inputs=[qacc],
+    outputs=[d.qacc_warmstart],
   )
 
 
@@ -1088,9 +1090,7 @@ def _record_solver_adjoint(m: Model, d: Data, qacc_array=None):
     qacc_smooth_ref = d.qacc_smooth
 
     tape.record_func(
-      lambda m=m, d=d, qa=qacc_array, qs=qacc_smooth_ref: solver_implicit_adjoint(
-        m, d, qacc_array=qa, qacc_smooth_ref=qs
-      ),
+      lambda m=m, d=d, qa=qacc_array, qs=qacc_smooth_ref: solver_implicit_adjoint(m, d, qacc_array=qa, qacc_smooth_ref=qs),
       [qacc_array, qacc_smooth_ref],
     )
 

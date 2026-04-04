@@ -39,8 +39,8 @@ wp.set_module_options({"enable_backward": False})
 # module-level enable_backward, causing double-counting with the manual adjoint.
 @wp.kernel(enable_backward=False)
 def _nograd_copy(
-    src: wp.array2d(dtype=float),
-    dst: wp.array2d(dtype=float),
+  src: wp.array2d(dtype=float),
+  dst: wp.array2d(dtype=float),
 ):
   worldid, idx = wp.tid()
   if idx < src.shape[1]:

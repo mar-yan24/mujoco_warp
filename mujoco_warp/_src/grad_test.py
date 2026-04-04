@@ -26,6 +26,10 @@ from mujoco_warp._src.grad import enable_grad
 # tolerance for AD vs finite-difference comparison
 _FD_TOL = 1e-3
 
+# step-level AD requires GPU (Warp tape backward does not produce gradients on CPU)
+_REQUIRES_GPU = not wp.get_device().is_cuda or wp.get_device().arch < 70
+_REQUIRES_GPU_REASON = "step-level AD requires CUDA with sm_70+"
+
 # sparse jacobian to avoid tile kernels (which require cuSolverDx)
 _SIMPLE_HINGE_XML = """
 <mujoco>
@@ -169,11 +173,7 @@ def _assert_step_ctrl_grad(
   eps=1e-3,
   err_msg="AD vs FD mismatch",
 ):
-  """Compare AD gradient dL/dctrl through step() against finite differences.
-
-  Args:
-    loss_on: "qpos" for sum(qpos) loss, "xpos" for sum(xpos) loss.
-  """
+  """Compare AD dL/dctrl through step() against finite differences."""
   fixture_kw = dict(xml=xml) | ({"keyframe": keyframe} if keyframe is not None else {})
   mjm, mjd, m, d = test_data.fixture(**fixture_kw)
   enable_grad(d)
@@ -403,18 +403,12 @@ class GradSmoothTest(parameterized.TestCase):
       err_msg=f"fwd_actuation grad mismatch ({name})",
     )
 
-  @absltest.skipIf(
-    wp.get_device().is_cuda and wp.get_device().arch < 70,
-    "tile kernels (cuSolverDx) require sm_70+",
-  )
+  @absltest.skipIf(_REQUIRES_GPU, _REQUIRES_GPU_REASON)
   def test_euler_step_grad(self):
     """Full Euler step gradient: dL/dctrl through step()."""
     _assert_step_ctrl_grad(self, _SIMPLE_HINGE_XML, loss_on="xpos", err_msg="euler step grad mismatch")
 
-  @absltest.skipIf(
-    wp.get_device().is_cuda and wp.get_device().arch < 70,
-    "tile kernels (cuSolverDx) require sm_70+",
-  )
+  @absltest.skipIf(_REQUIRES_GPU, _REQUIRES_GPU_REASON)
   def test_euler_step_grad_free(self):
     """Full Euler step gradient for freejoint + hinge model: dL/dctrl."""
     _assert_step_ctrl_grad(self, _FREE_HINGE_XML, loss_on="xpos", err_msg="euler step grad (freejoint+hinge) mismatch")
@@ -620,22 +614,20 @@ def _sum_qpos_kernel(
 
 
 class GradSolverAdjointTest(parameterized.TestCase):
-  @absltest.skipIf(
-    wp.get_device().is_cuda and wp.get_device().arch < 70,
-    "tile kernels (cuSolverDx) require sm_70+",
-  )
+  @absltest.skipIf(_REQUIRES_GPU, _REQUIRES_GPU_REASON)
   def test_solver_adjoint_contact_step(self):
     """dL/dctrl through step() with active contacts (Newton solver)."""
     _assert_step_ctrl_grad(
-      self, _CONTACT_SLIDE_XML, loss_on="qpos", keyframe=None,
-      atol=_CONTACT_FD_TOL, rtol=_CONTACT_FD_TOL,
+      self,
+      _CONTACT_SLIDE_XML,
+      loss_on="qpos",
+      keyframe=None,
+      atol=_CONTACT_FD_TOL,
+      rtol=_CONTACT_FD_TOL,
       err_msg="solver adjoint contact step grad mismatch",
     )
 
-  @absltest.skipIf(
-    wp.get_device().is_cuda and wp.get_device().arch < 70,
-    "tile kernels (cuSolverDx) require sm_70+",
-  )
+  @absltest.skipIf(_REQUIRES_GPU, _REQUIRES_GPU_REASON)
   def test_solver_adjoint_no_active_constraints(self):
     """No active contacts: solver adjoint should match Phase 1 (unconstrained)."""
     # Ball high above ground — no contact
@@ -656,26 +648,26 @@ class GradSolverAdjointTest(parameterized.TestCase):
     """
     _assert_step_ctrl_grad(self, xml, loss_on="qpos", keyframe=None, err_msg="solver adjoint no-contact grad mismatch")
 
-  @absltest.skipIf(
-    wp.get_device().is_cuda and wp.get_device().arch < 70,
-    "tile kernels (cuSolverDx) require sm_70+",
-  )
+  @absltest.skipIf(_REQUIRES_GPU, _REQUIRES_GPU_REASON)
   def test_solver_adjoint_identity_unconstrained(self):
     """njmax==0 (constraints disabled): identity pass-through."""
     _assert_step_ctrl_grad(
-      self, _SIMPLE_HINGE_XML, loss_on="xpos",
+      self,
+      _SIMPLE_HINGE_XML,
+      loss_on="xpos",
       err_msg="solver adjoint identity (unconstrained) grad mismatch",
     )
 
-  @absltest.skipIf(
-    wp.get_device().is_cuda and wp.get_device().arch < 70,
-    "tile kernels (cuSolverDx) require sm_70+",
-  )
+  @absltest.skipIf(_REQUIRES_GPU, _REQUIRES_GPU_REASON)
   def test_solver_adjoint_dense_jacobian(self):
     """Dense jacobian contact model: dL/dctrl through step()."""
     _assert_step_ctrl_grad(
-      self, _CONTACT_SLIDE_DENSE_XML, loss_on="qpos", keyframe=None,
-      atol=_CONTACT_FD_TOL, rtol=_CONTACT_FD_TOL,
+      self,
+      _CONTACT_SLIDE_DENSE_XML,
+      loss_on="qpos",
+      keyframe=None,
+      atol=_CONTACT_FD_TOL,
+      rtol=_CONTACT_FD_TOL,
       err_msg="solver adjoint dense jacobian grad mismatch",
     )
 
@@ -866,32 +858,27 @@ class GradIntegratorTest(parameterized.TestCase):
   -> integrator -> qpos.
   """
 
-  @absltest.skipIf(
-    wp.get_device().is_cuda and wp.get_device().arch < 70,
-    "tile kernels (cuSolverDx) require sm_70+",
-  )
+  @absltest.skipIf(_REQUIRES_GPU, _REQUIRES_GPU_REASON)
   def test_euler_qpos_grad_no_eulerdamp(self):
     """dL/dctrl through step() measured on qpos, eulerdamp disabled."""
     _assert_step_ctrl_grad(
-      self, _HINGE_EULERDAMP_DISABLED_XML, loss_on="qpos",
+      self,
+      _HINGE_EULERDAMP_DISABLED_XML,
+      loss_on="qpos",
       err_msg="AD vs FD mismatch for dL(qpos)/dctrl (eulerdamp disabled)",
     )
 
-  @absltest.skipIf(
-    wp.get_device().is_cuda and wp.get_device().arch < 70,
-    "tile kernels (cuSolverDx) require sm_70+",
-  )
+  @absltest.skipIf(_REQUIRES_GPU, _REQUIRES_GPU_REASON)
   def test_euler_qpos_grad_with_eulerdamp(self):
     """dL/dctrl through step() measured on qpos, eulerdamp enabled."""
     _assert_step_ctrl_grad(
-      self, _HINGE_EULERDAMP_ENABLED_XML, loss_on="qpos",
+      self,
+      _HINGE_EULERDAMP_ENABLED_XML,
+      loss_on="qpos",
       err_msg="AD vs FD mismatch for dL(qpos)/dctrl (eulerdamp enabled)",
     )
 
-  @absltest.skipIf(
-    wp.get_device().is_cuda and wp.get_device().arch < 70,
-    "tile kernels (cuSolverDx) require sm_70+",
-  )
+  @absltest.skipIf(_REQUIRES_GPU, _REQUIRES_GPU_REASON)
   def test_multistep_qpos_grad_nonzero(self):
     """dL/dctrl through 2 steps produces nonzero gradient."""
     xml = _HINGE_EULERDAMP_DISABLED_XML
@@ -994,10 +981,7 @@ _HINGE_EULERDAMP_ENABLED_DENSE_XML = """
 class GradEulerDampStressTest(parameterized.TestCase):
   """Stress tests for the euler damping adjoint with high damping and dense jacobian."""
 
-  @absltest.skipIf(
-    wp.get_device().is_cuda and wp.get_device().arch < 70,
-    "tile kernels (cuSolverDx) require sm_70+",
-  )
+  @absltest.skipIf(_REQUIRES_GPU, _REQUIRES_GPU_REASON)
   @parameterized.named_parameters(
     ("high_damp_sparse", _HINGE_EULERDAMP_HIGH_DAMPING_SPARSE_XML),
     ("high_damp_dense", _HINGE_EULERDAMP_HIGH_DAMPING_DENSE_XML),

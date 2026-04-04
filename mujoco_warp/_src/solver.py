@@ -34,7 +34,6 @@ wp.set_module_options({"enable_backward": False})
 _BLOCK_CHOLESKY_DIM = 32
 
 
-
 @dataclasses.dataclass
 class InverseContext:
   """Workspace arrays for inverse dynamics."""
@@ -3319,8 +3318,10 @@ def init_context(m: types.Model, d: types.Data, ctx: SolverContext | InverseCont
 def solve(m: types.Model, d: types.Data):
   if d.njmax == 0 or m.nv == 0:
     wp.launch(
-      support._nograd_copy, dim=(d.nworld, m.nv),
-      inputs=[d.qacc_smooth], outputs=[d.qacc],
+      support._nograd_copy,
+      dim=(d.nworld, m.nv),
+      inputs=[d.qacc_smooth],
+      outputs=[d.qacc],
     )
     d.solver_niter.fill_(0)
   else:
@@ -3332,13 +3333,17 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext):
   """Finds forces that satisfy constraints."""
   if not (m.opt.disableflags & types.DisableBit.WARMSTART):
     wp.launch(
-      support._nograd_copy, dim=(d.nworld, m.nv),
-      inputs=[d.qacc_warmstart], outputs=[d.qacc],
+      support._nograd_copy,
+      dim=(d.nworld, m.nv),
+      inputs=[d.qacc_warmstart],
+      outputs=[d.qacc],
     )
   else:
     wp.launch(
-      support._nograd_copy, dim=(d.nworld, m.nv),
-      inputs=[d.qacc_smooth], outputs=[d.qacc],
+      support._nograd_copy,
+      dim=(d.nworld, m.nv),
+      inputs=[d.qacc_smooth],
+      outputs=[d.qacc],
     )
 
   #  context
