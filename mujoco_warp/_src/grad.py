@@ -128,9 +128,11 @@ def enable_grad(d: Data, fields: Optional[Sequence[str]] = None) -> None:
       arr.requires_grad = True
 
 
-def disable_grad(d: Data) -> None:
-  """Disables gradient tracking on all Data arrays."""
-  for name in SMOOTH_GRAD_FIELDS:
+def disable_grad(d: Data, fields: Optional[Sequence[str]] = None) -> None:
+  """Disables gradient tracking on Data arrays."""
+  if fields is None:
+    fields = SMOOTH_GRAD_FIELDS + SOLVER_GRAD_FIELDS + COLLISION_GRAD_FIELDS
+  for name in fields:
     arr = _resolve_field(d, name)
     if arr is not None and isinstance(arr, wp.array):
       arr.requires_grad = False
