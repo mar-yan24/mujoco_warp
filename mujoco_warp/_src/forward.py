@@ -279,7 +279,13 @@ def _advance(m: Model, d: Data, qacc: wp.array, qvel: Optional[wp.array] = None)
     outputs=[d.time],
   )
 
-  wp.copy(d.qacc_warmstart, d.qacc)
+  # Use _nograd_copy: warmstart is a numerical hint, not a gradient path.
+  # wp.copy would be tracked on the tape and create cross-substep gradient
+  # leaks through the shared d.qacc_warmstart array.
+  wp.launch(
+    solver._nograd_copy, dim=(d.nworld, qacc.shape[1]),
+    inputs=[qacc], outputs=[d.qacc_warmstart],
+  )
 
 
 @wp.kernel
@@ -1015,7 +1021,7 @@ def _record_fwd_accel_adjoint(m: Model, d: Data):
   to the correct .grad memory.
   """
   tape = wp._src.context.runtime.tape
-  if tape is not None and d.qpos.requires_grad and not m.is_sparse:
+  if tape is not None and d.qpos.requires_grad:
     from mujoco_warp._src.adjoint import _accumulate_grad_kernel
 
     # Capture current array refs for correct gradient isolation across substeps
@@ -1026,6 +1032,7 @@ def _record_fwd_accel_adjoint(m: Model, d: Data):
       adj_qacc_smooth = qacc_smooth.grad
       if adj_qacc_smooth is None:
         return
+
       # qfrc_smooth.grad += M_inv * qacc_smooth.grad
       tmp = wp.zeros_like(qfrc_smooth)
       smooth.solve_m(m, d, tmp, adj_qacc_smooth)

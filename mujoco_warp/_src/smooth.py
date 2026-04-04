@@ -41,6 +41,20 @@ from mujoco_warp._src.warp_util import event_scope
 wp.set_module_options({"enable_backward": True})
 
 
+# Copy kernel invisible to tape backward. Used in _solve_LD_sparse to
+# initialize the solve intermediate from qfrc_smooth without creating an
+# auto-AD gradient path. The manual _record_fwd_accel_adjoint callback
+# handles the qacc_smooth -> qfrc_smooth gradient path instead.
+@wp.kernel(enable_backward=False)
+def _nograd_copy_2d(
+    src: wp.array2d(dtype=float),
+    dst: wp.array2d(dtype=float),
+):
+  worldid, idx = wp.tid()
+  if idx < src.shape[1]:
+    dst[worldid, idx] = src[worldid, idx]
+
+
 # kernel_analyzer: off
 @wp.func
 def _process_joint(
@@ -2868,7 +2882,13 @@ def transmission(m: Model, d: Data):
     )
 
 
-@wp.kernel
+# Sparse solve kernels have enable_backward=False because Warp's auto-AD
+# for in-place operations (x used as both input and output) accumulates
+# rather than replaces gradients, producing ~2x the correct result.
+# The manual _record_fwd_accel_adjoint callback handles the correct backward
+# (qacc_smooth.grad -> qfrc_smooth.grad via M^{-1}) for both sparse and dense.
+# This matches the dense Cholesky kernels which also have enable_backward=False.
+@wp.kernel(enable_backward=False)
 def _solve_LD_sparse_x_acc_up(
   # In:
   L: wp.array3d(dtype=float),
@@ -2882,7 +2902,7 @@ def _solve_LD_sparse_x_acc_up(
   wp.atomic_sub(x[worldid], i, L[worldid, 0, Madr_ki] * x[worldid, k])
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _solve_LD_sparse_qLDiag_mul(
   # In:
   D: wp.array2d(dtype=float),
@@ -2893,7 +2913,7 @@ def _solve_LD_sparse_qLDiag_mul(
   out[worldid, dofid] = out[worldid, dofid] * D[worldid, dofid]
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def _solve_LD_sparse_x_acc_down(
   # In:
   L: wp.array3d(dtype=float),
@@ -2915,8 +2935,16 @@ def _solve_LD_sparse(
   x: wp.array2d(dtype=float),
   y: wp.array2d(dtype=float),
 ):
-  """Computes sparse backsubstitution: x = inv(L'*D*L)*y."""
-  wp.copy(x, y)
+  """Computes sparse backsubstitution: x = inv(L'*D*L)*y.
+
+  The solve kernels have enable_backward=False to avoid Warp's auto-AD
+  accumulation bug with in-place operations (x used as both input and output
+  gives ~2x the correct gradient). The manual _record_fwd_accel_adjoint
+  callback handles the qacc_smooth -> qfrc_smooth gradient path instead.
+  """
+  # Use _nograd_copy_2d so the initial y->x copy doesn't create an auto-AD
+  # gradient path (the manual adjoint handles qacc_smooth -> qfrc_smooth).
+  wp.launch(_nograd_copy_2d, dim=(d.nworld, m.nv), inputs=[y], outputs=[x])
   for qLD_updates in reversed(m.qLD_updates):
     wp.launch(_solve_LD_sparse_x_acc_up, dim=(d.nworld, qLD_updates.size), inputs=[L, qLD_updates], outputs=[x])
 
