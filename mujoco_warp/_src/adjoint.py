@@ -1,7 +1,8 @@
 """custom adjoint definitions for MuJoCo Warp autodifferentiation.
 
-This module centralizes all ``@wp.func_grad`` registrations and the
-implicit differentiation adjoint for the constraint solver.
+This module centralizes all ``@wp.func_grad`` registrations, the
+implicit differentiation adjoint for the constraint solver, and the
+smooth constraint adjoint for friction gradient signal.
 
 Import this module via ``grad.py`` dont import it directly
 """
@@ -97,6 +98,91 @@ def _efc_pos_grad_kernel(
 
   adj_aref = efc_aref_grad_in[worldid, efcid]
   efc_pos_grad_out[worldid, efcid] = adj_aref * daref_dpos
+
+
+# ---------------------------------------------------------------------------
+# Smooth constraint adjoint: friction Hessian correction kernel
+# ---------------------------------------------------------------------------
+
+
+@wp.kernel
+def _smooth_hessian_friction_correction(
+  # Model:
+  nv: int,
+  # Contact data:
+  contact_efc_address_in: wp.array2d(dtype=int),
+  contact_dim_in: wp.array(dtype=int),
+  contact_type_in: wp.array(dtype=int),
+  contact_worldid_in: wp.array(dtype=int),
+  nacon_in: wp.array(dtype=int),
+  # Constraint data:
+  efc_J_in: wp.array3d(dtype=float),
+  efc_D_in: wp.array2d(dtype=float),
+  efc_state_in: wp.array2d(dtype=int),
+  # Parameters:
+  friction_viscosity: float,
+  friction_scale: float,
+  # Out:
+  H_out: wp.array3d(dtype=float),
+):
+  """Apply friction smoothing correction to the Hessian.
+
+  For each friction constraint row (dimid > 0):
+    - QUADRATIC (active): delta_D = D * (friction_scale - 1.0)  [reduces stiffness]
+    - Otherwise (SATISFIED etc): delta_D = friction_viscosity    [adds viscous term]
+
+  Applies delta_D * J_row^T * J_row to H via atomic_add.
+  """
+  conid, dimid = wp.tid()
+
+  if conid >= nacon_in[0]:
+    return
+
+  # Only process constraint contacts
+  if not (contact_type_in[conid] & 1):  # ContactType.CONSTRAINT = 1
+    return
+
+  # Skip normal direction (dimid=0) — only modify friction rows
+  if dimid == 0:
+    return
+
+  condim = contact_dim_in[conid]
+  if condim == 1:
+    return  # frictionless contact, no friction rows
+  if dimid >= 2 * (condim - 1):
+    return  # beyond valid friction dimensions
+
+  efcid = contact_efc_address_in[conid, dimid]
+  if efcid < 0:
+    return
+
+  worldid = contact_worldid_in[conid]
+
+  D = efc_D_in[worldid, efcid]
+  state = efc_state_in[worldid, efcid]
+
+  # Compute delta_D: difference between smooth D and what's currently in H
+  # QUADRATIC state (value=1): constraint was active, D is in H → reduce it
+  # SATISFIED state (value=0): constraint was inactive, 0 in H → add viscous
+  delta_D = float(0.0)
+  if state == 1:  # QUADRATIC
+    delta_D = D * (friction_scale - 1.0)
+  else:
+    delta_D = friction_viscosity
+
+  if delta_D == 0.0:
+    return
+
+  # Apply delta_D * J_row^T * J_row to H
+  for i in range(nv):
+    Ji = efc_J_in[worldid, efcid, i]
+    if Ji == 0.0:
+      continue
+    for j in range(nv):
+      Jj = efc_J_in[worldid, efcid, j]
+      if Jj == 0.0:
+        continue
+      wp.atomic_add(H_out, worldid, i, j, delta_D * Ji * Jj)
 
 
 @wp.func_grad(math.quat_integrate)
@@ -296,13 +382,26 @@ def _padding_h_adjoint(
   H_out[worldid, dofid, dofid] = 1.0
 
 
-def _solve_hessian_system(m: types.Model, d: types.Data, b, out):
-  """Solve H * x = b using stored solver Hessian."""
+def _solve_hessian_system(m: types.Model, d: types.Data, b, out, H=None):
+  """Solve H * x = b using stored solver Hessian or a provided H.
+
+  Args:
+    m: Model.
+    d: Data.
+    b: Right-hand side vector (nworld, nv_pad).
+    out: Solution vector (nworld, nv_pad).
+    H: Optional Hessian override. When provided, always factorizes from
+       scratch (ignores stored d.solver_hfactor). Used by smooth adjoint.
+  """
+  use_stored = H is None
+  if use_stored:
+    H = d.solver_h
+
   if m.nv <= _BLOCK_CHOLESKY_DIM:
     wp.launch_tiled(
       _adjoint_cholesky_tile(m.nv),
       dim=d.nworld,
-      inputs=[d.solver_h, b],
+      inputs=[H, b],
       outputs=[out],
       block_dim=m.block_dim.update_gradient_cholesky,
     )
@@ -310,8 +409,8 @@ def _solve_hessian_system(m: types.Model, d: types.Data, b, out):
     b_3d = b.reshape((d.nworld, m.nv_pad, 1))
     out_3d = out.reshape((d.nworld, m.nv_pad, 1))
 
-    if d.solver_hfactor.shape[1] > 0:
-      # Solve-only using stored Cholesky factor
+    if use_stored and d.solver_hfactor.shape[1] > 0:
+      # Solve-only using stored Cholesky factor (original H only)
       wp.launch_tiled(
         _adjoint_cholesky_blocked(types.TILE_SIZE_JTDAJ_DENSE, m.nv_pad),
         dim=d.nworld,
@@ -320,20 +419,19 @@ def _solve_hessian_system(m: types.Model, d: types.Data, b, out):
         block_dim=m.block_dim.update_gradient_cholesky_blocked,
       )
     else:
-      # Full factorize + solve (no stored factor)
-      # Pad diagonal for stability
+      # Full factorize + solve
       if m.nv_pad > m.nv:
         wp.launch(
           _padding_h_adjoint,
           dim=(d.nworld, m.nv_pad - m.nv),
           inputs=[m.nv],
-          outputs=[d.solver_h],
+          outputs=[H],
         )
       hfactor_tmp = wp.zeros((d.nworld, m.nv_pad, m.nv_pad), dtype=float)
       wp.launch_tiled(
         _adjoint_cholesky_full_blocked(types.TILE_SIZE_JTDAJ_DENSE, m.nv_pad),
         dim=d.nworld,
-        inputs=[d.solver_h, b_3d, m.nv, hfactor_tmp],
+        inputs=[H, b_3d, m.nv, hfactor_tmp],
         outputs=[out_3d],
         block_dim=m.block_dim.update_gradient_cholesky_blocked,
       )
@@ -372,11 +470,30 @@ def solver_implicit_adjoint(m: types.Model, d: types.Data, qacc_array=None, qacc
   if adj_qacc is None:
     return
 
-  if os.environ.get("MJW_DEBUG_ADJOINT") == "1":
+  debug_level = os.environ.get("MJW_DEBUG_ADJOINT", "0")
+  if debug_level in ("1", "2"):
     import numpy as np
 
     adj_norm = np.linalg.norm(adj_qacc.numpy())
     print(f"[adjoint] |adj_qacc|={adj_norm:.6e}, njmax={d.njmax}")
+
+  if debug_level == "2" and d.njmax > 0:
+    import numpy as np
+
+    efc_state_np = d.efc.state.numpy()
+    nefc_np = d.nefc.numpy()
+    for w in range(min(d.nworld, 1)):
+      ne = nefc_np[w]
+      n_quad = int(np.sum(efc_state_np[w, :ne] == 1))
+      n_sat = int(np.sum(efc_state_np[w, :ne] == 0))
+      H_np = d.solver_h.numpy()[w, :nv, :nv]
+      H_diag = np.diag(H_np)
+      cond_approx = np.max(H_diag) / max(np.min(H_diag[H_diag > 0]), 1e-30)
+      print(
+        f"[adjoint:diag] world={w} nefc={ne} QUAD={n_quad} SAT={n_sat}"
+        f" H_cond~{cond_approx:.1f}"
+        f" H_diag=[{np.min(H_diag):.3e}, {np.max(H_diag):.3e}]"
+      )
 
   if d.njmax == 0:
     # Solver was identity (qacc = qacc_smooth), accumulate adjoint through
@@ -413,6 +530,11 @@ def solver_implicit_adjoint(m: types.Model, d: types.Data, qacc_array=None, qacc
   )
 
   # Phase 3: compute efc-level gradients for collision chain
+  _efc_level_gradients(m, d, v)
+
+
+def _efc_level_gradients(m: types.Model, d: types.Data, v):
+  """Compute efc-level gradients for collision chain (shared by both adjoints)."""
   if d.njmax > 0:
     efc_J = d.efc.J
     if hasattr(efc_J, "grad") and efc_J.grad is not None:
@@ -444,3 +566,133 @@ def solver_implicit_adjoint(m: types.Model, d: types.Data, qacc_array=None, qacc
         ],
         outputs=[efc_pos.grad],
       )
+
+
+# ---------------------------------------------------------------------------
+# Smooth constraint adjoint: backward-only friction gradient smoothing
+# ---------------------------------------------------------------------------
+
+
+def solver_smooth_adjoint(
+  m: types.Model,
+  d: types.Data,
+  qacc_array=None,
+  qacc_smooth_ref=None,
+):
+  """Smooth constraint adjoint for friction gradient signal.
+
+  Like solver_implicit_adjoint, but builds a modified Hessian H_smooth that
+  reduces friction constraint stiffness and adds viscous friction for
+  SATISFIED constraints. This provides non-zero gradients through the friction
+  cone dead zone while keeping the forward physics unchanged.
+
+  Parameters are read from d.smooth_friction_viscosity and
+  d.smooth_friction_scale. Enable via d.smooth_adjoint = 1.
+
+  Args:
+    m: Model containing static simulation parameters.
+    d: Data containing mutable simulation state.
+    qacc_array: The array whose .grad contains the incoming adjoint.
+    qacc_smooth_ref: The qacc_smooth array whose .grad receives the
+                     accumulated adjoint.
+  """
+  nv = m.nv
+  if nv == 0:
+    return
+
+  if qacc_array is None:
+    qacc_array = d.qacc
+
+  if qacc_smooth_ref is None:
+    qacc_smooth_ref = d.qacc_smooth
+
+  adj_qacc = qacc_array.grad
+  if adj_qacc is None:
+    return
+
+  debug_level = os.environ.get("MJW_DEBUG_ADJOINT", "0")
+  if debug_level in ("1", "2"):
+    import numpy as np
+
+    adj_norm = np.linalg.norm(adj_qacc.numpy())
+    print(f"[smooth_adjoint] |adj_qacc|={adj_norm:.6e}, njmax={d.njmax}")
+
+  if d.njmax == 0:
+    wp.launch(
+      _accumulate_grad_kernel,
+      dim=(d.nworld, nv),
+      inputs=[adj_qacc],
+      outputs=[qacc_smooth_ref.grad],
+    )
+    return
+
+  if m.opt.solver != types.SolverType.NEWTON:
+    wp.launch(
+      _accumulate_grad_kernel,
+      dim=(d.nworld, nv),
+      inputs=[adj_qacc],
+      outputs=[qacc_smooth_ref.grad],
+    )
+    return
+
+  # Read smooth adjoint parameters from Data
+  friction_viscosity = getattr(d, "smooth_friction_viscosity", 10.0)
+  friction_scale = getattr(d, "smooth_friction_scale", 0.01)
+
+  # Build H_smooth = d.solver_h + friction correction
+  H_smooth = wp.clone(d.solver_h)
+
+  if d.naconmax > 0:
+    wp.launch(
+      _smooth_hessian_friction_correction,
+      dim=(d.naconmax, m.nmaxpyramid),
+      inputs=[
+        m.nv,
+        d.contact.efc_address,
+        d.contact.dim,
+        d.contact.type,
+        d.contact.worldid,
+        d.nacon,
+        d.efc.J,
+        d.efc.D,
+        d.efc.state,
+        friction_viscosity,
+        friction_scale,
+      ],
+      outputs=[H_smooth],
+    )
+
+  if debug_level == "2":
+    import numpy as np
+
+    H_np = H_smooth.numpy()[0, :nv, :nv]
+    H_orig = d.solver_h.numpy()[0, :nv, :nv]
+    diff = H_np - H_orig
+    print(
+      f"[smooth_adjoint:diag] H_smooth diag="
+      f"[{np.min(np.diag(H_np)):.3e}, {np.max(np.diag(H_np)):.3e}]"
+      f" |delta_H|_F={np.linalg.norm(diff):.3e}"
+    )
+
+  # Solve H_smooth * v = adj_qacc
+  v = wp.zeros((d.nworld, m.nv_pad), dtype=float)
+  _solve_hessian_system(m, d, adj_qacc, v, H=H_smooth)
+
+  if debug_level == "2":
+    import numpy as np
+
+    v_np = v.numpy()[0, :nv]
+    print(f"[smooth_adjoint:diag] |v|={np.linalg.norm(v_np):.6e} v={v_np}")
+
+  # adj_qacc_smooth += M * v
+  tmp = wp.zeros((d.nworld, m.nv_pad), dtype=float)
+  support.mul_m(m, d, tmp, v)
+  wp.launch(
+    _accumulate_grad_kernel,
+    dim=(d.nworld, nv),
+    inputs=[tmp],
+    outputs=[qacc_smooth_ref.grad],
+  )
+
+  # Phase 3: efc-level gradients for collision chain
+  _efc_level_gradients(m, d, v)

@@ -53,6 +53,8 @@ from mujoco_warp._src.grad import diff_forward as diff_forward
 from mujoco_warp._src.grad import diff_step as diff_step
 from mujoco_warp._src.grad import disable_grad as disable_grad
 from mujoco_warp._src.grad import enable_grad as enable_grad
+from mujoco_warp._src.grad import enable_smooth_adjoint as enable_smooth_adjoint
+from mujoco_warp._src.grad import disable_smooth_adjoint as disable_smooth_adjoint
 from mujoco_warp._src.grad import make_diff_data as make_diff_data
 from mujoco_warp._src.inverse import inverse as inverse
 from mujoco_warp._src.io import create_render_context as create_render_context

@@ -150,6 +150,36 @@ def make_diff_data(
   return d
 
 
+def enable_smooth_adjoint(
+  d: Data,
+  friction_viscosity: float = 10.0,
+  friction_scale: float = 0.01,
+) -> None:
+  """Enable smooth constraint adjoint for friction gradient signal.
+
+  Modifies the backward pass to build a smooth Hessian where friction
+  constraint stiffness is reduced (for active/QUADRATIC constraints) and
+  a viscous friction term is added (for satisfied/static constraints).
+  The forward physics is unchanged.
+
+  Args:
+    d: Data object (must have gradient tracking enabled).
+    friction_viscosity: D value added for SATISFIED friction constraints.
+        Higher values give stronger gradient signal at zero velocity.
+    friction_scale: Scale factor for QUADRATIC friction constraint D in
+        the adjoint Hessian. Lower values reduce friction stiffness more,
+        giving larger tangential gradients.
+  """
+  d.smooth_adjoint = 1
+  d.smooth_friction_viscosity = friction_viscosity
+  d.smooth_friction_scale = friction_scale
+
+
+def disable_smooth_adjoint(d: Data) -> None:
+  """Disable smooth constraint adjoint, reverting to standard implicit diff."""
+  d.smooth_adjoint = 0
+
+
 def _warn_if_cg_solver(m: Model, d: Data):
   """Warn if CG solver is used with constraints (gradients will be zero)."""
   if d.njmax > 0 and m.opt.solver != SolverType.NEWTON:

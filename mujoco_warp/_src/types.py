@@ -1780,6 +1780,9 @@ class Data:
     solver_h: solver retained Hessian for backward pass
     solver_hfactor: solver retained factored Hessian for backward pass
     solver_Jaref: solver retained Jacobian reference for backward pass
+    smooth_adjoint: enable smooth constraint adjoint (0=off, 1=on)
+    smooth_friction_viscosity: D value for SATISFIED friction constraints in smooth adjoint
+    smooth_friction_scale: D scale factor for QUADRATIC friction constraints in smooth adjoint
   """
 
   solver_niter: array("nworld", int)

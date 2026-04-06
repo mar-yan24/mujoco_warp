@@ -1083,18 +1083,26 @@ def _record_solver_adjoint(m: Model, d: Data, qacc_array=None):
   """
   tape = wp._src.context.runtime.tape
   if tape is not None and d.qpos.requires_grad:
-    from mujoco_warp._src.adjoint import solver_implicit_adjoint
-
     if qacc_array is None:
       qacc_array = d.qacc
 
     # Capture qacc_smooth ref at record time for gradient isolation
     qacc_smooth_ref = d.qacc_smooth
 
-    tape.record_func(
-      lambda m=m, d=d, qa=qacc_array, qs=qacc_smooth_ref: solver_implicit_adjoint(m, d, qacc_array=qa, qacc_smooth_ref=qs),
-      [qacc_array, qacc_smooth_ref],
-    )
+    if getattr(d, "smooth_adjoint", 0):
+      from mujoco_warp._src.adjoint import solver_smooth_adjoint
+
+      tape.record_func(
+        lambda m=m, d=d, qa=qacc_array, qs=qacc_smooth_ref: solver_smooth_adjoint(m, d, qacc_array=qa, qacc_smooth_ref=qs),
+        [qacc_array, qacc_smooth_ref],
+      )
+    else:
+      from mujoco_warp._src.adjoint import solver_implicit_adjoint
+
+      tape.record_func(
+        lambda m=m, d=d, qa=qacc_array, qs=qacc_smooth_ref: solver_implicit_adjoint(m, d, qacc_array=qa, qacc_smooth_ref=qs),
+        [qacc_array, qacc_smooth_ref],
+      )
 
 
 def _record_euler_damp_adjoint(m: Model, d: Data, qacc: wp.array):
