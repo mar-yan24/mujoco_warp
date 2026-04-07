@@ -154,6 +154,9 @@ def enable_smooth_adjoint(
   d: Data,
   friction_viscosity: float = 10.0,
   friction_scale: float = 0.01,
+  friction_bypass_kf: float = 0.0,
+  free_body_adjoint: bool = False,
+  penalty_damping_alpha: float = 0.0,
 ) -> None:
   """Enable smooth constraint adjoint for friction gradient signal.
 
@@ -169,10 +172,23 @@ def enable_smooth_adjoint(
     friction_scale: Scale factor for QUADRATIC friction constraint D in
         the adjoint Hessian. Lower values reduce friction stiffness more,
         giving larger tangential gradients.
+    friction_bypass_kf: Scale for friction gradient bypass. After the
+        Hessian solve, restores tangential gradient components that were
+        attenuated by H^{-1}. 0=off, 1=full bypass, >1=amplified.
+    free_body_adjoint: When True, replaces the solver adjoint entirely
+        with v = M^{-1} * adj_qacc (free-body assumption). Eliminates
+        all constraint attenuation. Overrides friction_scale/bypass_kf.
+    penalty_damping_alpha: Friction damping factor for penalty-model
+        adjoint. Attenuates v in friction directions by (1-alpha) per
+        face, mimicking dflex's bounded BPTT eigenvalues. Implies
+        free-body base (M^{-1}). 0=off, 0.1-0.3=typical.
   """
   d.smooth_adjoint = 1
   d.smooth_friction_viscosity = friction_viscosity
   d.smooth_friction_scale = friction_scale
+  d.smooth_friction_bypass_kf = friction_bypass_kf
+  d.smooth_free_body_adjoint = free_body_adjoint
+  d.smooth_penalty_damping_alpha = penalty_damping_alpha
 
 
 def disable_smooth_adjoint(d: Data) -> None:

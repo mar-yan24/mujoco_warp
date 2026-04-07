@@ -185,6 +185,157 @@ def _smooth_hessian_friction_correction(
       wp.atomic_add(H_out, worldid, i, j, delta_D * Ji * Jj)
 
 
+# ---------------------------------------------------------------------------
+# Smooth constraint adjoint: friction gradient bypass kernel
+# ---------------------------------------------------------------------------
+
+
+@wp.kernel
+def _friction_bypass_correction(
+  # Model:
+  nv: int,
+  # Contact data:
+  contact_efc_address_in: wp.array2d(dtype=int),
+  contact_dim_in: wp.array(dtype=int),
+  contact_type_in: wp.array(dtype=int),
+  contact_worldid_in: wp.array(dtype=int),
+  nacon_in: wp.array(dtype=int),
+  # Constraint data:
+  efc_J_in: wp.array3d(dtype=float),
+  # Solve results:
+  v_hessian_in: wp.array2d(dtype=float),
+  v_free_in: wp.array2d(dtype=float),
+  # Parameters:
+  bypass_kf: float,
+  # Out:
+  v_out: wp.array2d(dtype=float),
+):
+  """Friction gradient bypass: restore tangential gradients attenuated by H^{-1}.
+
+  For each friction constraint face (dimid > 0), computes:
+    delta = J_fric . (v_free - v_hessian)   [gradient lost to friction attenuation]
+    v_out += kf * J_fric^T * delta            [inject it back, scaled by kf]
+
+  v_hessian = H^{-1} * adj_qacc  (attenuated in friction directions)
+  v_free    = M^{-1} * adj_qacc  (what gradient would be without constraints)
+
+  This makes the backward pass produce dflex-like friction gradients while
+  keeping the forward physics unchanged.
+  """
+  conid, dimid = wp.tid()
+
+  if conid >= nacon_in[0]:
+    return
+
+  # Only process constraint contacts
+  if not (contact_type_in[conid] & 1):  # ContactType.CONSTRAINT = 1
+    return
+
+  # Skip normal direction (dimid=0) — only bypass friction rows
+  if dimid == 0:
+    return
+
+  condim = contact_dim_in[conid]
+  if condim == 1:
+    return  # frictionless contact, no friction rows
+  if dimid >= 2 * (condim - 1):
+    return  # beyond valid friction dimensions
+
+  efcid = contact_efc_address_in[conid, dimid]
+  if efcid < 0:
+    return
+
+  worldid = contact_worldid_in[conid]
+
+  # Compute delta = J_fric . (v_free - v_hessian) for this friction face
+  delta = float(0.0)
+  for dofid in range(nv):
+    J_val = efc_J_in[worldid, efcid, dofid]
+    if J_val != 0.0:
+      delta += J_val * (v_free_in[worldid, dofid] - v_hessian_in[worldid, dofid])
+
+  # Apply correction: v_out += kf * J_fric^T * delta
+  if delta != 0.0:
+    scaled_delta = bypass_kf * delta
+    for dofid in range(nv):
+      J_val = efc_J_in[worldid, efcid, dofid]
+      if J_val != 0.0:
+        wp.atomic_add(v_out, worldid, dofid, scaled_delta * J_val)
+
+
+# ---------------------------------------------------------------------------
+# Penalty-model adjoint: friction damping kernel
+# ---------------------------------------------------------------------------
+
+
+@wp.kernel
+def _penalty_friction_damping(
+  # Model:
+  nv: int,
+  # Contact data:
+  contact_efc_address_in: wp.array2d(dtype=int),
+  contact_dim_in: wp.array(dtype=int),
+  contact_type_in: wp.array(dtype=int),
+  contact_worldid_in: wp.array(dtype=int),
+  nacon_in: wp.array(dtype=int),
+  # Constraint data:
+  efc_J_in: wp.array3d(dtype=float),
+  # Input:
+  v_free_in: wp.array2d(dtype=float),
+  # Parameters:
+  damping_alpha: float,
+  # Out:
+  v_out: wp.array2d(dtype=float),
+):
+  """Apply penalty-model friction damping to the free-body adjoint.
+
+  For each friction face: v_out -= alpha * J_fric^T * (J_fric . v_free)
+
+  This attenuates v in friction directions by factor (1 - alpha), mimicking
+  dflex's penalty friction gradient where d(v_next)/d(v_prev) has eigenvalues
+  < 1 in friction-constrained directions.  Provides natural BPTT decay that
+  prevents gradient explosion while preserving gradient direction.
+  """
+  conid, dimid = wp.tid()
+
+  if conid >= nacon_in[0]:
+    return
+
+  if not (contact_type_in[conid] & 1):
+    return
+
+  # Friction rows only (dimid > 0)
+  if dimid == 0:
+    return
+
+  condim = contact_dim_in[conid]
+  if condim == 1:
+    return
+  if dimid >= 2 * (condim - 1):
+    return
+
+  efcid = contact_efc_address_in[conid, dimid]
+  if efcid < 0:
+    return
+
+  worldid = contact_worldid_in[conid]
+
+  # Project v_free onto this friction face
+  proj = float(0.0)
+  for dofid in range(nv):
+    J_val = efc_J_in[worldid, efcid, dofid]
+    if J_val != 0.0:
+      proj += J_val * v_free_in[worldid, dofid]
+
+  # Subtract friction damping: v_out -= alpha * J^T * proj
+  if proj != 0.0:
+    scaled = damping_alpha * proj
+    for dofid in range(nv):
+      J_val = efc_J_in[worldid, efcid, dofid]
+      if J_val != 0.0:
+        wp.atomic_add(v_out, worldid, dofid, -scaled * J_val)
+
+
 @wp.func_grad(math.quat_integrate)
 def _quat_integrate_grad(q: wp.quat, v: wp.vec3, dt: float, adj_ret: wp.quat):
   """Custom adjoint avoiding gradient singularity at |v|=0."""
@@ -636,53 +787,123 @@ def solver_smooth_adjoint(
     return
 
   # Read smooth adjoint parameters from Data
-  friction_viscosity = getattr(d, "smooth_friction_viscosity", 10.0)
-  friction_scale = getattr(d, "smooth_friction_scale", 0.01)
+  free_body = getattr(d, "smooth_free_body_adjoint", False)
+  penalty_alpha = getattr(d, "smooth_penalty_damping_alpha", 0.0)
 
-  # Build H_smooth = d.solver_h + friction correction
-  H_smooth = wp.clone(d.solver_h)
+  if free_body or penalty_alpha > 0.0:
+    # Free-body base: v = M^{-1} * adj_qacc
+    # Eliminates H^{-1} attenuation entirely.
+    from mujoco_warp._src.smooth import solve_m
 
-  if d.naconmax > 0:
-    wp.launch(
-      _smooth_hessian_friction_correction,
-      dim=(d.naconmax, m.nmaxpyramid),
-      inputs=[
-        m.nv,
-        d.contact.efc_address,
-        d.contact.dim,
-        d.contact.type,
-        d.contact.worldid,
-        d.nacon,
-        d.efc.J,
-        d.efc.D,
-        d.efc.state,
-        friction_viscosity,
-        friction_scale,
-      ],
-      outputs=[H_smooth],
-    )
+    v = wp.zeros((d.nworld, m.nv_pad), dtype=float)
+    solve_m(m, d, v, adj_qacc)
 
-  if debug_level == "2":
-    import numpy as np
+    # Penalty-model friction damping: attenuate v in friction directions
+    # by factor (1 - alpha) per face, mimicking dflex's penalty friction
+    # d(v_next)/d(v_prev) eigenvalues.  Provides natural BPTT decay.
+    if penalty_alpha > 0.0 and d.naconmax > 0:
+      v_free = wp.clone(v)  # save unmodified for projection
+      wp.launch(
+        _penalty_friction_damping,
+        dim=(d.naconmax, m.nmaxpyramid),
+        inputs=[
+          m.nv,
+          d.contact.efc_address,
+          d.contact.dim,
+          d.contact.type,
+          d.contact.worldid,
+          d.nacon,
+          d.efc.J,
+          v_free,
+          penalty_alpha,
+        ],
+        outputs=[v],
+      )
 
-    H_np = H_smooth.numpy()[0, :nv, :nv]
-    H_orig = d.solver_h.numpy()[0, :nv, :nv]
-    diff = H_np - H_orig
-    print(
-      f"[smooth_adjoint:diag] H_smooth diag="
-      f"[{np.min(np.diag(H_np)):.3e}, {np.max(np.diag(H_np)):.3e}]"
-      f" |delta_H|_F={np.linalg.norm(diff):.3e}"
-    )
+  else:
+    # Original smooth adjoint: H_smooth with friction correction + optional bypass
+    friction_viscosity = getattr(d, "smooth_friction_viscosity", 10.0)
+    friction_scale = getattr(d, "smooth_friction_scale", 0.01)
+    bypass_kf = getattr(d, "smooth_friction_bypass_kf", 0.0)
 
-  # Solve H_smooth * v = adj_qacc
-  v = wp.zeros((d.nworld, m.nv_pad), dtype=float)
-  _solve_hessian_system(m, d, adj_qacc, v, H=H_smooth)
+    # Build H_smooth = d.solver_h + friction correction
+    H_smooth = wp.clone(d.solver_h)
 
-  if debug_level == "2":
-    import numpy as np
+    if d.naconmax > 0:
+      wp.launch(
+        _smooth_hessian_friction_correction,
+        dim=(d.naconmax, m.nmaxpyramid),
+        inputs=[
+          m.nv,
+          d.contact.efc_address,
+          d.contact.dim,
+          d.contact.type,
+          d.contact.worldid,
+          d.nacon,
+          d.efc.J,
+          d.efc.D,
+          d.efc.state,
+          friction_viscosity,
+          friction_scale,
+        ],
+        outputs=[H_smooth],
+      )
 
-    v_np = v.numpy()[0, :nv]
-    print(f"[smooth_adjoint:diag] |v|={np.linalg.norm(v_np):.6e} v={v_np}")
+    if debug_level == "2":
+      import numpy as np
+
+      H_np = H_smooth.numpy()[0, :nv, :nv]
+      H_orig = d.solver_h.numpy()[0, :nv, :nv]
+      diff = H_np - H_orig
+      print(
+        f"[smooth_adjoint:diag] H_smooth diag="
+        f"[{np.min(np.diag(H_np)):.3e}, {np.max(np.diag(H_np)):.3e}]"
+        f" |delta_H|_F={np.linalg.norm(diff):.3e}"
+      )
+
+    # Solve H_smooth * v = adj_qacc
+    v = wp.zeros((d.nworld, m.nv_pad), dtype=float)
+    _solve_hessian_system(m, d, adj_qacc, v, H=H_smooth)
+
+    if debug_level == "2":
+      import numpy as np
+
+      v_np = v.numpy()[0, :nv]
+      print(f"[smooth_adjoint:diag] |v|={np.linalg.norm(v_np):.6e} v={v_np}")
+
+    # Friction gradient bypass: restore tangential gradients attenuated by H^{-1}
+    if bypass_kf > 0.0 and d.naconmax > 0:
+      from mujoco_warp._src.smooth import solve_m
+
+      v_free = wp.zeros((d.nworld, m.nv_pad), dtype=float)
+      solve_m(m, d, v_free, adj_qacc)
+
+      wp.launch(
+        _friction_bypass_correction,
+        dim=(d.naconmax, m.nmaxpyramid),
+        inputs=[
+          m.nv,
+          d.contact.efc_address,
+          d.contact.dim,
+          d.contact.type,
+          d.contact.worldid,
+          d.nacon,
+          d.efc.J,
+          v,
+          v_free,
+          bypass_kf,
+        ],
+        outputs=[v],
+      )
+
+      if debug_level == "2":
+        import numpy as np
+
+        v_bypass = v.numpy()[0, :nv]
+        print(
+          f"[smooth_adjoint:diag] bypass kf={bypass_kf} "
+          f"|v_after_bypass|={np.linalg.norm(v_bypass):.6e}"
+        )
 
   # adj_qacc_smooth += M * v
   tmp = wp.zeros((d.nworld, m.nv_pad), dtype=float)
