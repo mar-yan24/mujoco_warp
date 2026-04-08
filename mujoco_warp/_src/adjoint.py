@@ -263,7 +263,6 @@ def _friction_bypass_correction(
         wp.atomic_add(v_out, worldid, dofid, scaled_delta * J_val)
 
 
-# ---------------------------------------------------------------------------
 # Penalty-model adjoint: friction damping kernel
 # ---------------------------------------------------------------------------
 
@@ -789,8 +788,71 @@ def solver_smooth_adjoint(
   # Read smooth adjoint parameters from Data
   free_body = getattr(d, "smooth_free_body_adjoint", False)
   penalty_alpha = getattr(d, "smooth_penalty_damping_alpha", 0.0)
+  surrogate = getattr(d, "smooth_friction_surrogate_adjoint", False)
+  surrogate_alpha = float(getattr(d, "smooth_friction_surrogate_alpha", 0.0))
+  if surrogate_alpha < 0.0:
+    surrogate_alpha = 0.0
+  elif surrogate_alpha > 1.0:
+    surrogate_alpha = 1.0
 
-  if free_body or penalty_alpha > 0.0:
+  if surrogate:
+    friction_viscosity = getattr(d, "smooth_friction_viscosity", 10.0)
+    friction_scale = getattr(d, "smooth_friction_scale", 0.01)
+
+    H_smooth = wp.clone(d.solver_h)
+
+    if d.naconmax > 0:
+      wp.launch(
+        _smooth_hessian_friction_correction,
+        dim=(d.naconmax, m.nmaxpyramid),
+        inputs=[
+          m.nv,
+          d.contact.efc_address,
+          d.contact.dim,
+          d.contact.type,
+          d.contact.worldid,
+          d.nacon,
+          d.efc.J,
+          d.efc.D,
+          d.efc.state,
+          friction_viscosity,
+          friction_scale,
+        ],
+        outputs=[H_smooth],
+      )
+
+    v_hessian = wp.zeros((d.nworld, m.nv_pad), dtype=float)
+    _solve_hessian_system(m, d, adj_qacc, v_hessian, H=H_smooth)
+
+    from mujoco_warp._src.smooth import solve_m
+
+    v_free = wp.zeros((d.nworld, m.nv_pad), dtype=float)
+    solve_m(m, d, v_free, adj_qacc)
+
+    v = wp.clone(v_hessian)
+    if d.naconmax > 0:
+      # Recover only a controlled fraction of the tangential free-body signal.
+      # alpha=0 keeps the full bypass, alpha=1 leaves the smooth/Newton result.
+      correction_scale = 1.0 - surrogate_alpha
+      wp.launch(
+        _friction_bypass_correction,
+        dim=(d.naconmax, m.nmaxpyramid),
+        inputs=[
+          m.nv,
+          d.contact.efc_address,
+          d.contact.dim,
+          d.contact.type,
+          d.contact.worldid,
+          d.nacon,
+          d.efc.J,
+          v_hessian,
+          v_free,
+          correction_scale,
+        ],
+        outputs=[v],
+      )
+
+  elif free_body or penalty_alpha > 0.0:
     # Free-body base: v = M^{-1} * adj_qacc
     # Eliminates H^{-1} attenuation entirely.
     from mujoco_warp._src.smooth import solve_m

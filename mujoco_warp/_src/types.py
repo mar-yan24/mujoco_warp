@@ -1783,6 +1783,9 @@ class Data:
     smooth_adjoint: enable smooth constraint adjoint (0=off, 1=on)
     smooth_friction_viscosity: D value for SATISFIED friction constraints in smooth adjoint
     smooth_friction_scale: D scale factor for QUADRATIC friction constraints in smooth adjoint
+    smooth_friction_surrogate_adjoint: replace friction-face backward projections
+      with damped free-body targets while keeping solver-informed normal handling
+    smooth_friction_surrogate_alpha: damping factor for the friction surrogate
   """
 
   solver_niter: array("nworld", int)

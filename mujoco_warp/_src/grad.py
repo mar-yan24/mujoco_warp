@@ -157,6 +157,8 @@ def enable_smooth_adjoint(
   friction_bypass_kf: float = 0.0,
   free_body_adjoint: bool = False,
   penalty_damping_alpha: float = 0.0,
+  friction_surrogate_adjoint: bool = False,
+  friction_surrogate_alpha: float = 0.0,
 ) -> None:
   """Enable smooth constraint adjoint for friction gradient signal.
 
@@ -182,6 +184,16 @@ def enable_smooth_adjoint(
         adjoint. Attenuates v in friction directions by (1-alpha) per
         face, mimicking dflex's bounded BPTT eigenvalues. Implies
         free-body base (M^{-1}). 0=off, 0.1-0.3=typical.
+    friction_surrogate_adjoint: When True, keeps the smooth/Newton solve
+        as the baseline but replaces friction-face backward projections
+        with a damped tangential recovery toward the free-body solution.
+        This preserves solver-informed normal-contact handling while using
+        a training-oriented surrogate
+        in tangential directions.
+    friction_surrogate_alpha: Tangential damping factor for the friction
+        surrogate branch. 0=full tangential recovery, 0.9=10% recovery,
+        1=disabled. Values in 0.8-0.95 are the intended range for
+        soft-contact ant experiments.
   """
   d.smooth_adjoint = 1
   d.smooth_friction_viscosity = friction_viscosity
@@ -189,6 +201,8 @@ def enable_smooth_adjoint(
   d.smooth_friction_bypass_kf = friction_bypass_kf
   d.smooth_free_body_adjoint = free_body_adjoint
   d.smooth_penalty_damping_alpha = penalty_damping_alpha
+  d.smooth_friction_surrogate_adjoint = friction_surrogate_adjoint
+  d.smooth_friction_surrogate_alpha = friction_surrogate_alpha
 
 
 def disable_smooth_adjoint(d: Data) -> None:
