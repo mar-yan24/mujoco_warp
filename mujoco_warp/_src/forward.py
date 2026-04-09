@@ -1227,13 +1227,20 @@ def _isolate_intermediates_for_ad(m: Model, d: Data):
   to its own memory. The tape records operations on these unique arrays, and
   backward routes each substep's adjoint to the correct .grad memory.
 
-  Only called when AD is active (d.qpos.requires_grad).
+  Only called when AD is active on an active tape.
 
   Every array here appears as an output of wp.launch in the pipeline. If
   shared across substeps, Warp's adjoint zeroes the output .grad during
   the later substep's backward, corrupting the earlier substep's gradient
   chain.  The allocation overhead is ~25KB/step (negligible for GPU).
   """
+
+  def _clone_with_grad(arr):
+    """Clone arrays that contain static world data and preserve gradients."""
+    cloned = wp.clone(arr)
+    cloned.requires_grad = True
+    return cloned
+
   nw = d.nworld
   nv = m.nv
   nu = m.nu
@@ -1251,9 +1258,10 @@ def _isolate_intermediates_for_ad(m: Model, d: Data):
   # These use Warp vector/matrix dtypes (vec3, mat33, etc.) so use
   # zeros_like to match the exact dtype and shape from the existing arrays.
   d.xpos = wp.zeros_like(d.xpos, requires_grad=True)
-  d.xmat = wp.zeros_like(d.xmat, requires_grad=True)
+  # Preserve rows that are only initialized once, such as the world body.
+  d.xmat = _clone_with_grad(d.xmat)
   d.xipos = wp.zeros_like(d.xipos, requires_grad=True)
-  d.ximat = wp.zeros_like(d.ximat, requires_grad=True)
+  d.ximat = _clone_with_grad(d.ximat)
   d.subtree_com = wp.zeros_like(d.subtree_com, requires_grad=True)
   d.cinert = wp.zeros_like(d.cinert, requires_grad=True)
   d.cdof = wp.zeros_like(d.cdof, requires_grad=True)
@@ -1269,8 +1277,10 @@ def _isolate_intermediates_for_ad(m: Model, d: Data):
   d.qLDiagInv = wp.zeros((nw, nv), dtype=float, requires_grad=True)
 
   # --- Geometry / joint kinematics ---
-  d.geom_xpos = wp.zeros_like(d.geom_xpos, requires_grad=True)
-  d.geom_xmat = wp.zeros_like(d.geom_xmat, requires_grad=True)
+  # Static world geoms are not recomputed in smooth._geom_local_to_global(),
+  # so keep their initialized transforms while giving each step unique storage.
+  d.geom_xpos = _clone_with_grad(d.geom_xpos)
+  d.geom_xmat = _clone_with_grad(d.geom_xmat)
   d.xanchor = wp.zeros_like(d.xanchor, requires_grad=True)
   d.xaxis = wp.zeros_like(d.xaxis, requires_grad=True)
   d.subtree_linvel = wp.zeros_like(d.subtree_linvel, requires_grad=True)
@@ -1286,9 +1296,10 @@ def step(m: Model, d: Data):
   # TODO(team): mj_checkPos
   # TODO(team): mj_checkVel
 
-  # Allocate fresh intermediate arrays when AD is active to prevent
-  # cross-substep gradient accumulation in tape-all mode.
-  if d.qpos.requires_grad:
+  # Allocate fresh intermediate arrays only while recording on a tape. Forward
+  # rollouts on diff data still need the initialized static transforms.
+  tape = wp._src.context.runtime.tape
+  if d.qpos.requires_grad and tape is not None:
     _isolate_intermediates_for_ad(m, d)
 
   forward(m, d, record_solver_adjoint=False)

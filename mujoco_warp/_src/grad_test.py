@@ -600,6 +600,26 @@ _CONTACT_SLIDE_DENSE_XML = """
 </mujoco>
 """
 
+_CONTACT_TANGENTIAL_XML = """
+<mujoco>
+  <option gravity="0 0 -9.81" jacobian="dense" solver="Newton" iterations="30"/>
+  <worldbody>
+    <geom type="plane" size="5 5 0.01"/>
+    <body pos="0 0 0.11">
+      <joint name="jx" type="slide" axis="1 0 0"/>
+      <joint name="jz" type="slide" axis="0 0 1"/>
+      <geom type="sphere" size="0.1" mass="1" friction="1.0 0.005 0.0001"/>
+    </body>
+  </worldbody>
+  <actuator>
+    <motor joint="jx" gear="1"/>
+  </actuator>
+  <keyframe>
+    <key qpos="0 0" qvel="0 0" ctrl="0.2"/>
+  </keyframe>
+</mujoco>
+"""
+
 # Tolerance for contact AD tests (relaxed for contacts)
 _CONTACT_FD_TOL = 1e-2
 
@@ -616,6 +636,42 @@ def _sum_qpos_kernel(
 
 
 class GradSolverAdjointTest(parameterized.TestCase):
+  def _step_ctrl_grad_norm(self, xml, smooth_kwargs, settle_steps=60):
+    """Return ||d(sum(qpos_next))/d(ctrl)|| on a settled contact state."""
+    mjm, _, m, d = test_data.fixture(xml=xml, keyframe=0)
+    enable_grad(d)
+    mjw.enable_smooth_adjoint(d, **smooth_kwargs)
+
+    # Settle forward-only to get a representative contact state.
+    for _ in range(settle_steps):
+      mjw.step(m, d)
+
+    qpos_settled = wp.clone(d.qpos)
+    qvel_settled = wp.clone(d.qvel)
+    ctrl_settled = wp.clone(d.ctrl)
+
+    d = mjw.make_diff_data(mjm)
+    enable_grad(d)
+    mjw.reset_data(m, d)
+    wp.copy(d.qpos, qpos_settled)
+    wp.copy(d.qvel, qvel_settled)
+    wp.copy(d.ctrl, ctrl_settled)
+    mjw.enable_smooth_adjoint(d, **smooth_kwargs)
+
+    loss = wp.zeros(1, dtype=float, requires_grad=True)
+    tape = wp.Tape()
+    with tape:
+      mjw.step(m, d)
+      wp.launch(
+        _sum_qpos_kernel,
+        dim=(d.nworld, mjm.nq),
+        inputs=[d.qpos, loss],
+      )
+    tape.backward(loss=loss)
+    grad = d.ctrl.grad.numpy()[0, : mjm.nu].copy()
+    tape.zero()
+    return float(np.linalg.norm(grad))
+
   @absltest.skipIf(_REQUIRES_GPU, _REQUIRES_GPU_REASON)
   def test_solver_adjoint_contact_step(self):
     """dL/dctrl through step() with active contacts (Newton solver)."""
@@ -672,6 +728,34 @@ class GradSolverAdjointTest(parameterized.TestCase):
       rtol=_CONTACT_FD_TOL,
       err_msg="solver adjoint dense jacobian grad mismatch",
     )
+
+  @absltest.skipIf(_REQUIRES_GPU, _REQUIRES_GPU_REASON)
+  def test_surrogate_correction_bounded_relative_to_free_body(self):
+    """Surrogate tangential correction should stay bounded vs free-body."""
+    grad_free = self._step_ctrl_grad_norm(
+      _CONTACT_TANGENTIAL_XML,
+      smooth_kwargs=dict(
+        free_body_adjoint=True,
+      ),
+    )
+    grad_sur_90 = self._step_ctrl_grad_norm(
+      _CONTACT_TANGENTIAL_XML,
+      smooth_kwargs=dict(
+        friction_surrogate_adjoint=True,
+        friction_surrogate_alpha=0.9,
+      ),
+    )
+    grad_sur_99 = self._step_ctrl_grad_norm(
+      _CONTACT_TANGENTIAL_XML,
+      smooth_kwargs=dict(
+        friction_surrogate_adjoint=True,
+        friction_surrogate_alpha=0.99,
+      ),
+    )
+
+    self.assertGreater(grad_free, 1.0e-6)
+    self.assertLessEqual(grad_sur_90, grad_free * 1.05)
+    self.assertLessEqual(grad_sur_99, grad_free * 1.05)
 
 
 class GradUtilTest(absltest.TestCase):

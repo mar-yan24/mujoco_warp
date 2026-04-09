@@ -263,6 +263,91 @@ def _friction_bypass_correction(
         wp.atomic_add(v_out, worldid, dofid, scaled_delta * J_val)
 
 
+@wp.kernel
+def _friction_bypass_correction_normalized(
+  # Model:
+  nv: int,
+  # Contact data:
+  contact_efc_address_in: wp.array2d(dtype=int),
+  contact_dim_in: wp.array(dtype=int),
+  contact_type_in: wp.array(dtype=int),
+  contact_worldid_in: wp.array(dtype=int),
+  nacon_in: wp.array(dtype=int),
+  # Constraint data:
+  efc_J_in: wp.array3d(dtype=float),
+  # Solve results:
+  v_hessian_in: wp.array2d(dtype=float),
+  v_free_in: wp.array2d(dtype=float),
+  # Parameters:
+  bypass_kf: float,
+  max_ratio: float,
+  norm_eps: float,
+  # Out:
+  v_out: wp.array2d(dtype=float),
+):
+  """Normalized and capped friction bypass correction.
+
+  Projects the free-body delta onto each friction row and injects only a
+  bounded fraction of that projected component.
+
+  Compared to _friction_bypass_correction this avoids scaling by ||J_row||^2
+  and prevents over-injection when contact rows become poorly conditioned.
+  """
+  conid, dimid = wp.tid()
+
+  if conid >= nacon_in[0]:
+    return
+
+  # Only process constraint contacts
+  if not (contact_type_in[conid] & 1):  # ContactType.CONSTRAINT = 1
+    return
+
+  # Skip normal direction (dimid=0) - only bypass friction rows
+  if dimid == 0:
+    return
+
+  condim = contact_dim_in[conid]
+  if condim == 1:
+    return
+  if dimid >= 2 * (condim - 1):
+    return
+
+  efcid = contact_efc_address_in[conid, dimid]
+  if efcid < 0:
+    return
+
+  worldid = contact_worldid_in[conid]
+
+  delta = float(0.0)
+  j_norm2 = float(0.0)
+  for dofid in range(nv):
+    J_val = efc_J_in[worldid, efcid, dofid]
+    if J_val != 0.0:
+      delta += J_val * (v_free_in[worldid, dofid] - v_hessian_in[worldid, dofid])
+      j_norm2 += J_val * J_val
+
+  if j_norm2 <= norm_eps:
+    return
+
+  # Row-normalized projection coefficient.
+  base_coeff = delta / j_norm2
+  coeff = bypass_kf * base_coeff
+
+  # Bound injected magnitude relative to the projected free-body component.
+  max_coeff = wp.abs(base_coeff) * max_ratio
+  abs_coeff = wp.abs(coeff)
+  if abs_coeff > max_coeff and abs_coeff > 0.0:
+    coeff = coeff * (max_coeff / abs_coeff)
+
+  if coeff == 0.0:
+    return
+
+  for dofid in range(nv):
+    J_val = efc_J_in[worldid, efcid, dofid]
+    if J_val != 0.0:
+      wp.atomic_add(v_out, worldid, dofid, coeff * J_val)
+
+
 # Penalty-model adjoint: friction damping kernel
 # ---------------------------------------------------------------------------
 
@@ -834,8 +919,10 @@ def solver_smooth_adjoint(
       # Recover only a controlled fraction of the tangential free-body signal.
       # alpha=0 keeps the full bypass, alpha=1 leaves the smooth/Newton result.
       correction_scale = 1.0 - surrogate_alpha
+      correction_cap_ratio = 1.0
+      correction_norm_eps = 1.0e-8
       wp.launch(
-        _friction_bypass_correction,
+        _friction_bypass_correction_normalized,
         dim=(d.naconmax, m.nmaxpyramid),
         inputs=[
           m.nv,
@@ -848,6 +935,8 @@ def solver_smooth_adjoint(
           v_hessian,
           v_free,
           correction_scale,
+          correction_cap_ratio,
+          correction_norm_eps,
         ],
         outputs=[v],
       )
