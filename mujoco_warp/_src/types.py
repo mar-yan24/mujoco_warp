@@ -1872,6 +1872,11 @@ class Data:
   nacon: array(1, int)
   ncollision: array(1, int)
 
+  # solver retained state for backward pass (Phase 2 implicit differentiation)
+  solver_h: wp.array3d(dtype=float)
+  solver_hfactor: wp.array3d(dtype=float)
+  solver_Jaref: wp.array2d(dtype=float)
+
 
 @dataclasses.dataclass
 class RenderContext:

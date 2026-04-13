@@ -957,6 +957,9 @@ def make_data(
     "njmax_nnz": njmax_nnz,
     "qM": None,
     "qLD": None,
+    "solver_h": None,
+    "solver_hfactor": None,
+    "solver_Jaref": None,
     # world body
     "xquat": wp.array(np.tile(mjd.xquat, (nworld, 1)), shape=(nworld, mjm.nbody), dtype=wp.quat),
     "xmat": wp.array(np.tile(mjd.xmat, (nworld, 1)), shape=(nworld, mjm.nbody), dtype=wp.mat33),
@@ -988,6 +991,21 @@ def make_data(
   else:
     d.qM = wp.zeros((nworld, sizes["nv_pad"], sizes["nv_pad"]), dtype=float)
     d.qLD = wp.zeros((nworld, mjm.nv, mjm.nv), dtype=float)
+
+  # solver retained state for backward pass
+  _alloc_h = mjm.opt.solver == mujoco.mjtSolver.mjSOL_NEWTON
+  _alloc_hfactor = _alloc_h and mjm.nv > 32  # _BLOCK_CHOLESKY_DIM
+  d.solver_h = (
+    wp.zeros((nworld, sizes["nv_pad"], sizes["nv_pad"]), dtype=float)
+    if _alloc_h
+    else wp.empty((nworld, 0, 0), dtype=float)
+  )
+  d.solver_hfactor = (
+    wp.zeros((nworld, sizes["nv_pad"], sizes["nv_pad"]), dtype=float)
+    if _alloc_hfactor
+    else wp.empty((nworld, 0, 0), dtype=float)
+  )
+  d.solver_Jaref = wp.empty((nworld, njmax), dtype=float)
 
   # island discovery arrays
   d.nisland = wp.zeros((nworld,), dtype=int)
@@ -1185,6 +1203,9 @@ def put_data(
     "solver_niter": None,
     "qM": None,
     "qLD": None,
+    "solver_h": None,
+    "solver_hfactor": None,
+    "solver_Jaref": None,
     "nacon": None,
     # island arrays
     "nisland": None,
@@ -1213,6 +1234,21 @@ def put_data(
     qM_padded = np.pad(qM, ((0, padding), (0, padding)), mode="constant", constant_values=0.0)
     d.qM = wp.array(np.full((nworld, sizes["nv_pad"], sizes["nv_pad"]), qM_padded), dtype=float)
     d.qLD = wp.array(np.full((nworld, mjm.nv, mjm.nv), qLD), dtype=float)
+
+  # solver retained state for backward pass
+  _alloc_h = mjm.opt.solver == mujoco.mjtSolver.mjSOL_NEWTON
+  _alloc_hfactor = _alloc_h and mjm.nv > 32  # _BLOCK_CHOLESKY_DIM
+  d.solver_h = (
+    wp.zeros((nworld, sizes["nv_pad"], sizes["nv_pad"]), dtype=float)
+    if _alloc_h
+    else wp.empty((nworld, 0, 0), dtype=float)
+  )
+  d.solver_hfactor = (
+    wp.zeros((nworld, sizes["nv_pad"], sizes["nv_pad"]), dtype=float)
+    if _alloc_hfactor
+    else wp.empty((nworld, 0, 0), dtype=float)
+  )
+  d.solver_Jaref = wp.empty((nworld, njmax), dtype=float)
 
   # island arrays
   d.nisland = wp.array(np.full(nworld, mjd.nisland), dtype=int)
