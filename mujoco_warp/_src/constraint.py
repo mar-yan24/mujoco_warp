@@ -68,20 +68,20 @@ def _per_world_exclusive_scan_2d(
   # In:
   counts_in: wp.array2d[int],  # (nworld, N)
   nnz_counts_in: wp.array2d[int],  # (nworld, N)
+  # Data out:
+  nefc_out: wp.array[int],
   # Out:
+  efc_nnz_out: wp.array[int],
   offsets_out: wp.array2d[int],  # (nworld, N)
   nnz_offsets_out: wp.array2d[int],  # (nworld, N)
-  base_out: wp.array[int],  # (nworld,) snapshot of nefc_inout before bump
-  nnz_base_out: wp.array[int],  # (nworld,) snapshot of efc_nnz_inout before bump
-  # InOut:
-  nefc_inout: wp.array[int],
-  efc_nnz_inout: wp.array[int],
+  base_out: wp.array[int],  # (nworld,) snapshot of nefc_out before bump
+  nnz_base_out: wp.array[int],  # (nworld,) snapshot of efc_nnz_out before bump
 ):
   worldid = wp.tid()
 
   # snapshot the pre-bump totals so downstream emit kernels can read a stable base
-  base_out[worldid] = nefc_inout[worldid]
-  nnz_base_out[worldid] = efc_nnz_inout[worldid]
+  base_out[worldid] = nefc_out[worldid]
+  nnz_base_out[worldid] = efc_nnz_out[worldid]
 
   acc = int(0)
   acc_nnz = int(0)
@@ -92,13 +92,13 @@ def _per_world_exclusive_scan_2d(
     acc += counts_in[worldid, i]
     acc_nnz += nnz_counts_in[worldid, i]
 
-  nefc_inout[worldid] += acc
-  efc_nnz_inout[worldid] += acc_nnz
+  nefc_out[worldid] += acc
+  efc_nnz_out[worldid] += acc_nnz
 
 
 @wp.kernel
 def _contact_world_boundaries(
-  # In:
+  # Data in:
   contact_worldid_in: wp.array[int],
   nacon_in: wp.array[int],
   # Out:
@@ -129,19 +129,19 @@ def _contact_per_world_scan(
   nnz_counts_in: wp.array2d[int],  # (naconmax, nsubdim)
   world_start_in: wp.array[int],  # (nworld,)
   world_end_in: wp.array[int],  # (nworld,)
+  # Data out:
+  nefc_out: wp.array[int],
   # Out:
+  efc_nnz_out: wp.array[int],
   offsets_out: wp.array2d[int],  # (naconmax, nsubdim)
   nnz_offsets_out: wp.array2d[int],  # (naconmax, nsubdim)
   base_out: wp.array[int],  # (nworld,)
   nnz_base_out: wp.array[int],  # (nworld,)
-  # InOut:
-  nefc_inout: wp.array[int],
-  efc_nnz_inout: wp.array[int],
 ):
   worldid = wp.tid()
 
-  base_out[worldid] = nefc_inout[worldid]
-  nnz_base_out[worldid] = efc_nnz_inout[worldid]
+  base_out[worldid] = nefc_out[worldid]
+  nnz_base_out[worldid] = efc_nnz_out[worldid]
 
   acc = int(0)
   acc_nnz = int(0)
@@ -155,22 +155,25 @@ def _contact_per_world_scan(
       acc += counts_in[cid, sub]
       acc_nnz += nnz_counts_in[cid, sub]
 
-  nefc_inout[worldid] += acc
-  efc_nnz_inout[worldid] += acc_nnz
+  nefc_out[worldid] += acc
+  efc_nnz_out[worldid] += acc_nnz
 
 
 @wp.func
 def _dof_tree_rownnz(
+  # Model:
   body_weldid: wp.array[int],
-  body_dofadr: wp.array[int],
   body_dofnum: wp.array[int],
+  body_dofadr: wp.array[int],
   dof_parentid: wp.array[int],
+  # In:
   body1: int,
   body2: int,
 ) -> int:
-  """Counts non-zeros in a 2-body (body1, body2) Jacobian row by walking the
-  dof parent tree. Matches the rownnz walk used in _equality_connect and
-  _equality_weld (continues through common dofs)."""
+  """Counts non-zeros in a 2-body Jacobian row.
+
+  Matches the rownnz walk used in `_equality_connect` and `_equality_weld`.
+  """
   b1 = body_weldid[body1]
   b2 = body_weldid[body2]
   pda1 = int(body_dofadr[b1] + body_dofnum[b1] - 1)
@@ -188,16 +191,19 @@ def _dof_tree_rownnz(
 
 @wp.func
 def _contact_dof_tree_rownnz(
+  # Model:
   body_weldid: wp.array[int],
-  body_dofadr: wp.array[int],
   body_dofnum: wp.array[int],
+  body_dofadr: wp.array[int],
   dof_parentid: wp.array[int],
+  # In:
   body1: int,
   body2: int,
 ) -> int:
-  """Counts non-zeros in a 2-body contact Jacobian row by walking the dof
-  parent tree. Breaks on common dofs — matches the rownnz walk used in
-  _contact_pyramidal and _contact_elliptic."""
+  """Counts non-zeros in a 2-body contact Jacobian row.
+
+  Matches the rownnz walk used in `_contact_pyramidal` and `_contact_elliptic`.
+  """
   b1 = body_weldid[body1]
   b2 = body_weldid[body2]
   pda1 = int(body_dofadr[b1] + body_dofnum[b1] - 1)
@@ -218,16 +224,20 @@ def _contact_dof_tree_rownnz(
 
 @wp.func
 def _tendon_merge_rownnz(
+  # Model:
   nv: int,
   ten_J_rownnz: wp.array[int],
   ten_J_rowadr: wp.array[int],
   ten_J_colind: wp.array[int],
+  # In:
   obj1id: int,
   obj2id: int,
   has_obj2: bool,
 ) -> int:
-  """Counts unique dofs across two tendon Jacobians — matches the rownnz
-  walk in _equality_tendon (upper bound for slot reservation)."""
+  """Counts unique dofs across two tendon Jacobians.
+
+  Matches the rownnz walk in `_equality_tendon`.
+  """
   rownnz1 = ten_J_rownnz[obj1id]
   rowadr1 = ten_J_rowadr[obj1id]
   rownnz2 = int(0)
@@ -362,9 +372,7 @@ def _equality_connect_count(
     else:
       body1 = obj1id
       body2 = obj2id
-    rownnz = _dof_tree_rownnz(
-      body_weldid, body_dofadr, body_dofnum, dof_parentid, body1, body2
-    )
+    rownnz = _dof_tree_rownnz(body_weldid, body_dofnum, body_dofadr, dof_parentid, body1, body2)
     nnz_count_out[worldid, eqconnectid] = 3 * rownnz
   else:
     nnz_count_out[worldid, eqconnectid] = 0
@@ -405,6 +413,7 @@ def _equality_connect(is_sparse: bool, deterministic: bool):
     cdof_in: wp.array2d[wp.spatial_vector],
     njmax_in: int,
     njmax_nnz_in: int,
+    # In:
     nefc_base_in: wp.array[int],
     efcid_offsets_in: wp.array2d[int],
     nnz_base_in: wp.array[int],
@@ -678,6 +687,7 @@ def _equality_joint(is_sparse: bool, deterministic: bool):
     eq_active_in: wp.array2d[bool],
     njmax_in: int,
     njmax_nnz_in: int,
+    # In:
     nefc_base_in: wp.array[int],
     efcid_offsets_in: wp.array2d[int],
     nnz_base_in: wp.array[int],
@@ -860,6 +870,7 @@ def _equality_tendon(is_sparse: bool, deterministic: bool):
     ten_length_in: wp.array2d[float],
     njmax_in: int,
     njmax_nnz_in: int,
+    # In:
     nefc_base_in: wp.array[int],
     efcid_offsets_in: wp.array2d[int],
     nnz_base_in: wp.array[int],
@@ -1080,6 +1091,7 @@ def _equality_flex(is_sparse: bool, deterministic: bool):
     flexedge_length_in: wp.array2d[float],
     njmax_in: int,
     njmax_nnz_in: int,
+    # In:
     nefc_base_in: wp.array[int],
     efcid_offsets_in: wp.array2d[int],
     nnz_base_in: wp.array[int],
@@ -1222,9 +1234,7 @@ def _equality_weld_count(
     else:
       body1 = obj1id
       body2 = obj2id
-    rownnz = _dof_tree_rownnz(
-      body_weldid, body_dofadr, body_dofnum, dof_parentid, body1, body2
-    )
+    rownnz = _dof_tree_rownnz(body_weldid, body_dofnum, body_dofadr, dof_parentid, body1, body2)
     nnz_count_out[worldid, eqweldid] = 6 * rownnz
   else:
     nnz_count_out[worldid, eqweldid] = 0
@@ -1267,6 +1277,7 @@ def _equality_weld(is_sparse: bool, deterministic: bool):
     cdof_in: wp.array2d[wp.spatial_vector],
     njmax_in: int,
     njmax_nnz_in: int,
+    # In:
     nefc_base_in: wp.array[int],
     efcid_offsets_in: wp.array2d[int],
     nnz_base_in: wp.array[int],
@@ -1602,6 +1613,7 @@ def _friction_dof(is_sparse: bool, deterministic: bool):
     qvel_in: wp.array2d[float],
     njmax_in: int,
     njmax_nnz_in: int,
+    # In:
     nefc_base_in: wp.array[int],
     efcid_offsets_in: wp.array2d[int],
     nnz_base_in: wp.array[int],
@@ -1729,16 +1741,16 @@ def _friction_tendon(is_sparse: bool, deterministic: bool):
     tendon_solimp_fri: wp.array2d[vec5],
     tendon_frictionloss: wp.array2d[float],
     tendon_invweight0: wp.array2d[float],
-    # Deterministic-mode inputs:
-    nefc_base_in: wp.array[int],
-    efcid_offsets_in: wp.array2d[int],
-    nnz_base_in: wp.array[int],
-    nnz_offsets_in: wp.array2d[int],
     # Data in:
     qvel_in: wp.array2d[float],
     ten_J_in: wp.array2d[float],
     njmax_in: int,
     njmax_nnz_in: int,
+    # In:
+    nefc_base_in: wp.array[int],
+    efcid_offsets_in: wp.array2d[int],
+    nnz_base_in: wp.array[int],
+    nnz_offsets_in: wp.array2d[int],
     # Data out:
     nf_out: wp.array[int],
     nefc_out: wp.array[int],
@@ -1899,6 +1911,7 @@ def _limit_slide_hinge(is_sparse: bool, deterministic: bool):
     qvel_in: wp.array2d[float],
     njmax_in: int,
     njmax_nnz_in: int,
+    # In:
     nefc_base_in: wp.array[int],
     efcid_offsets_in: wp.array2d[int],
     nnz_base_in: wp.array[int],
@@ -2056,6 +2069,7 @@ def _limit_ball(is_sparse: bool, deterministic: bool):
     qvel_in: wp.array2d[float],
     njmax_in: int,
     njmax_nnz_in: int,
+    # In:
     nefc_base_in: wp.array[int],
     efcid_offsets_in: wp.array2d[int],
     nnz_base_in: wp.array[int],
@@ -2231,6 +2245,7 @@ def _limit_tendon(is_sparse: bool, deterministic: bool):
     ten_length_in: wp.array2d[float],
     njmax_in: int,
     njmax_nnz_in: int,
+    # In:
     nefc_base_in: wp.array[int],
     efcid_offsets_in: wp.array2d[int],
     nnz_base_in: wp.array[int],
@@ -2357,7 +2372,7 @@ def _contact_pyramidal_count(
   is_sparse: bool,
   # Data in:
   nacon_in: wp.array[int],
-  # Contact in:
+  # In:
   dist_in: wp.array[float],
   condim_in: wp.array[int],
   includemargin_in: wp.array[float],
@@ -2420,9 +2435,7 @@ def _contact_pyramidal_count(
       vert = vert_in[conid]
       body2 = flex_vertbodyid[flex_vertadr[flex[1]] + vert[1]]
 
-    rownnz = _contact_dof_tree_rownnz(
-      body_weldid, body_dofadr, body_dofnum, dof_parentid, body1, body2
-    )
+    rownnz = _contact_dof_tree_rownnz(body_weldid, body_dofnum, body_dofadr, dof_parentid, body1, body2)
     nnz_count_out[conid, dimid] = rownnz
   else:
     nnz_count_out[conid, dimid] = 0
@@ -2448,11 +2461,6 @@ def _contact_pyramidal(is_sparse: bool, deterministic: bool):
     geom_bodyid: wp.array[int],
     flex_vertadr: wp.array[int],
     flex_vertbodyid: wp.array[int],
-    # Deterministic-mode inputs:
-    nefc_base_in: wp.array[int],
-    efcid_offsets_in: wp.array2d[int],
-    nnz_base_in: wp.array[int],
-    nnz_offsets_in: wp.array2d[int],
     # Data in:
     qvel_in: wp.array2d[float],
     subtree_com_in: wp.array2d[wp.vec3],
@@ -2461,6 +2469,10 @@ def _contact_pyramidal(is_sparse: bool, deterministic: bool):
     njmax_nnz_in: int,
     nacon_in: wp.array[int],
     # In:
+    nefc_base_in: wp.array[int],
+    efcid_offsets_in: wp.array2d[int],
+    nnz_base_in: wp.array[int],
+    nnz_offsets_in: wp.array2d[int],
     dist_in: wp.array[float],
     condim_in: wp.array[int],
     includemargin_in: wp.array[float],
@@ -2729,7 +2741,7 @@ def _contact_elliptic_count(
   is_sparse: bool,
   # Data in:
   nacon_in: wp.array[int],
-  # Contact in:
+  # In:
   dist_in: wp.array[float],
   condim_in: wp.array[int],
   includemargin_in: wp.array[float],
@@ -2788,9 +2800,7 @@ def _contact_elliptic_count(
       vert = vert_in[conid]
       body2 = flex_vertbodyid[flex_vertadr[flex[1]] + vert[1]]
 
-    rownnz = _contact_dof_tree_rownnz(
-      body_weldid, body_dofadr, body_dofnum, dof_parentid, body1, body2
-    )
+    rownnz = _contact_dof_tree_rownnz(body_weldid, body_dofnum, body_dofadr, dof_parentid, body1, body2)
     nnz_count_out[conid, dimid] = rownnz
   else:
     nnz_count_out[conid, dimid] = 0
@@ -2816,11 +2826,6 @@ def _contact_elliptic(is_sparse: bool, deterministic: bool):
     geom_bodyid: wp.array[int],
     flex_vertadr: wp.array[int],
     flex_vertbodyid: wp.array[int],
-    # Deterministic-mode inputs:
-    nefc_base_in: wp.array[int],
-    efcid_offsets_in: wp.array2d[int],
-    nnz_base_in: wp.array[int],
-    nnz_offsets_in: wp.array2d[int],
     # Data in:
     qvel_in: wp.array2d[float],
     subtree_com_in: wp.array2d[wp.vec3],
@@ -2829,6 +2834,10 @@ def _contact_elliptic(is_sparse: bool, deterministic: bool):
     njmax_nnz_in: int,
     nacon_in: wp.array[int],
     # In:
+    nefc_base_in: wp.array[int],
+    efcid_offsets_in: wp.array2d[int],
+    nnz_base_in: wp.array[int],
+    nnz_offsets_in: wp.array2d[int],
     dist_in: wp.array[float],
     condim_in: wp.array[int],
     includemargin_in: wp.array[float],
@@ -3120,13 +3129,12 @@ def make_constraint(m: types.Model, d: types.Data):
       efc_nnz,
     ]
 
-  def _scan_launch(dim, counts, nnz_counts, offsets, nnz_offsets,
-                   nefc_base, nnz_base):
+  def _scan_launch(dim, counts, nnz_counts, offsets, nnz_offsets, nefc_base, nnz_base):
     wp.launch(
       _per_world_exclusive_scan_2d,
       dim=d.nworld,
       inputs=[counts, nnz_counts],
-      outputs=[offsets, nnz_offsets, nefc_base, nnz_base, d.nefc, efc_nnz],
+      outputs=[d.nefc, efc_nnz, offsets, nnz_offsets, nefc_base, nnz_base],
     )
 
   def _alloc_scan_bufs(dim):
@@ -3143,9 +3151,7 @@ def make_constraint(m: types.Model, d: types.Data):
       # --- equality_connect ---
       _dim = (d.nworld, m.eq_connect_adr.size)
       if det:
-        counts, nnz_counts, offsets, nnz_offsets, nefc_base, nnz_base = (
-          _alloc_scan_bufs(_dim)
-        )
+        counts, nnz_counts, offsets, nnz_offsets, nefc_base, nnz_base = _alloc_scan_bufs(_dim)
         wp.launch(
           _equality_connect_count,
           dim=_dim,
@@ -3165,8 +3171,7 @@ def make_constraint(m: types.Model, d: types.Data):
           ],
           outputs=[counts, nnz_counts],
         )
-        _scan_launch(_dim, counts, nnz_counts, offsets, nnz_offsets,
-                     nefc_base, nnz_base)
+        _scan_launch(_dim, counts, nnz_counts, offsets, nnz_offsets, nefc_base, nnz_base)
       else:
         nefc_base, offsets, nnz_base, nnz_offsets = _d1, _d2, _d1, _d2
       wp.launch(
@@ -3213,9 +3218,7 @@ def make_constraint(m: types.Model, d: types.Data):
       # --- equality_weld ---
       _dim = (d.nworld, m.eq_wld_adr.size)
       if det:
-        counts, nnz_counts, offsets, nnz_offsets, nefc_base, nnz_base = (
-          _alloc_scan_bufs(_dim)
-        )
+        counts, nnz_counts, offsets, nnz_offsets, nefc_base, nnz_base = _alloc_scan_bufs(_dim)
         wp.launch(
           _equality_weld_count,
           dim=_dim,
@@ -3235,8 +3238,7 @@ def make_constraint(m: types.Model, d: types.Data):
           ],
           outputs=[counts, nnz_counts],
         )
-        _scan_launch(_dim, counts, nnz_counts, offsets, nnz_offsets,
-                     nefc_base, nnz_base)
+        _scan_launch(_dim, counts, nnz_counts, offsets, nnz_offsets, nefc_base, nnz_base)
       else:
         nefc_base, offsets, nnz_base, nnz_offsets = _d1, _d2, _d1, _d2
       wp.launch(
@@ -3285,9 +3287,7 @@ def make_constraint(m: types.Model, d: types.Data):
       # --- equality_joint ---
       _dim = (d.nworld, m.eq_jnt_adr.size)
       if det:
-        counts, nnz_counts, offsets, nnz_offsets, nefc_base, nnz_base = (
-          _alloc_scan_bufs(_dim)
-        )
+        counts, nnz_counts, offsets, nnz_offsets, nefc_base, nnz_base = _alloc_scan_bufs(_dim)
         wp.launch(
           _equality_joint_count,
           dim=_dim,
@@ -3299,8 +3299,7 @@ def make_constraint(m: types.Model, d: types.Data):
           ],
           outputs=[counts, nnz_counts],
         )
-        _scan_launch(_dim, counts, nnz_counts, offsets, nnz_offsets,
-                     nefc_base, nnz_base)
+        _scan_launch(_dim, counts, nnz_counts, offsets, nnz_offsets, nefc_base, nnz_base)
       else:
         nefc_base, offsets, nnz_base, nnz_offsets = _d1, _d2, _d1, _d2
       wp.launch(
@@ -3336,9 +3335,7 @@ def make_constraint(m: types.Model, d: types.Data):
       # --- equality_tendon ---
       _dim = (d.nworld, m.eq_ten_adr.size)
       if det:
-        counts, nnz_counts, offsets, nnz_offsets, nefc_base, nnz_base = (
-          _alloc_scan_bufs(_dim)
-        )
+        counts, nnz_counts, offsets, nnz_offsets, nefc_base, nnz_base = _alloc_scan_bufs(_dim)
         wp.launch(
           _equality_tendon_count,
           dim=_dim,
@@ -3355,8 +3352,7 @@ def make_constraint(m: types.Model, d: types.Data):
           ],
           outputs=[counts, nnz_counts],
         )
-        _scan_launch(_dim, counts, nnz_counts, offsets, nnz_offsets,
-                     nefc_base, nnz_base)
+        _scan_launch(_dim, counts, nnz_counts, offsets, nnz_offsets, nefc_base, nnz_base)
       else:
         nefc_base, offsets, nnz_base, nnz_offsets = _d1, _d2, _d1, _d2
       wp.launch(
@@ -3395,9 +3391,7 @@ def make_constraint(m: types.Model, d: types.Data):
       _nflex = m.eq_flex_adr.size * m.nflexedge
       _dim_flat = (d.nworld, _nflex)
       if det:
-        counts, nnz_counts, offsets, nnz_offsets, nefc_base, nnz_base = (
-          _alloc_scan_bufs(_dim_flat)
-        )
+        counts, nnz_counts, offsets, nnz_offsets, nefc_base, nnz_base = _alloc_scan_bufs(_dim_flat)
         wp.launch(
           _equality_flex_count,
           dim=(d.nworld, m.eq_flex_adr.size, m.nflexedge),
@@ -3411,8 +3405,7 @@ def make_constraint(m: types.Model, d: types.Data):
           ],
           outputs=[counts, nnz_counts],
         )
-        _scan_launch(_dim_flat, counts, nnz_counts, offsets, nnz_offsets,
-                     nefc_base, nnz_base)
+        _scan_launch(_dim_flat, counts, nnz_counts, offsets, nnz_offsets, nefc_base, nnz_base)
       else:
         nefc_base, offsets, nnz_base, nnz_offsets = _d1, _d2, _d1, _d2
       wp.launch(
@@ -3450,17 +3443,14 @@ def make_constraint(m: types.Model, d: types.Data):
       # --- friction_dof ---
       _dim = (d.nworld, m.nv)
       if det:
-        counts, nnz_counts, offsets, nnz_offsets, nefc_base, nnz_base = (
-          _alloc_scan_bufs(_dim)
-        )
+        counts, nnz_counts, offsets, nnz_offsets, nefc_base, nnz_base = _alloc_scan_bufs(_dim)
         wp.launch(
           _friction_dof_count,
           dim=_dim,
           inputs=[m.dof_frictionloss, m.is_sparse],
           outputs=[counts, nnz_counts],
         )
-        _scan_launch(_dim, counts, nnz_counts, offsets, nnz_offsets,
-                     nefc_base, nnz_base)
+        _scan_launch(_dim, counts, nnz_counts, offsets, nnz_offsets, nefc_base, nnz_base)
       else:
         nefc_base, offsets, nnz_base, nnz_offsets = _d1, _d2, _d1, _d2
       wp.launch(
@@ -3488,17 +3478,14 @@ def make_constraint(m: types.Model, d: types.Data):
       # --- friction_tendon ---
       _dim = (d.nworld, m.ntendon)
       if det:
-        counts, nnz_counts, offsets, nnz_offsets, nefc_base, nnz_base = (
-          _alloc_scan_bufs(_dim)
-        )
+        counts, nnz_counts, offsets, nnz_offsets, nefc_base, nnz_base = _alloc_scan_bufs(_dim)
         wp.launch(
           _friction_tendon_count,
           dim=_dim,
           inputs=[m.ten_J_rownnz, m.tendon_frictionloss, m.is_sparse],
           outputs=[counts, nnz_counts],
         )
-        _scan_launch(_dim, counts, nnz_counts, offsets, nnz_offsets,
-                     nefc_base, nnz_base)
+        _scan_launch(_dim, counts, nnz_counts, offsets, nnz_offsets, nefc_base, nnz_base)
       else:
         nefc_base, offsets, nnz_base, nnz_offsets = _d1, _d2, _d1, _d2
       wp.launch(
@@ -3515,14 +3502,14 @@ def make_constraint(m: types.Model, d: types.Data):
           m.tendon_solimp_fri,
           m.tendon_frictionloss,
           m.tendon_invweight0,
-          nefc_base,
-          offsets,
-          nnz_base,
-          nnz_offsets,
           d.qvel,
           d.ten_J,
           d.njmax,
           d.njmax_nnz,
+          nefc_base,
+          offsets,
+          nnz_base,
+          nnz_offsets,
         ],
         outputs=_efc_outputs(d.nf),
       )
@@ -3532,9 +3519,7 @@ def make_constraint(m: types.Model, d: types.Data):
       # --- limit_ball ---
       _dim = (d.nworld, m.jnt_limited_ball_adr.size)
       if det:
-        counts, nnz_counts, offsets, nnz_offsets, nefc_base, nnz_base = (
-          _alloc_scan_bufs(_dim)
-        )
+        counts, nnz_counts, offsets, nnz_offsets, nefc_base, nnz_base = _alloc_scan_bufs(_dim)
         wp.launch(
           _limit_ball_count,
           dim=_dim,
@@ -3548,8 +3533,7 @@ def make_constraint(m: types.Model, d: types.Data):
           ],
           outputs=[counts, nnz_counts],
         )
-        _scan_launch(_dim, counts, nnz_counts, offsets, nnz_offsets,
-                     nefc_base, nnz_base)
+        _scan_launch(_dim, counts, nnz_counts, offsets, nnz_offsets, nefc_base, nnz_base)
       else:
         nefc_base, offsets, nnz_base, nnz_offsets = _d1, _d2, _d1, _d2
       wp.launch(
@@ -3582,9 +3566,7 @@ def make_constraint(m: types.Model, d: types.Data):
       # --- limit_slide_hinge ---
       _dim = (d.nworld, m.jnt_limited_slide_hinge_adr.size)
       if det:
-        counts, nnz_counts, offsets, nnz_offsets, nefc_base, nnz_base = (
-          _alloc_scan_bufs(_dim)
-        )
+        counts, nnz_counts, offsets, nnz_offsets, nefc_base, nnz_base = _alloc_scan_bufs(_dim)
         wp.launch(
           _limit_slide_hinge_count,
           dim=_dim,
@@ -3598,8 +3580,7 @@ def make_constraint(m: types.Model, d: types.Data):
           ],
           outputs=[counts, nnz_counts],
         )
-        _scan_launch(_dim, counts, nnz_counts, offsets, nnz_offsets,
-                     nefc_base, nnz_base)
+        _scan_launch(_dim, counts, nnz_counts, offsets, nnz_offsets, nefc_base, nnz_base)
       else:
         nefc_base, offsets, nnz_base, nnz_offsets = _d1, _d2, _d1, _d2
       wp.launch(
@@ -3632,9 +3613,7 @@ def make_constraint(m: types.Model, d: types.Data):
       # --- limit_tendon ---
       _dim = (d.nworld, m.tendon_limited_adr.size)
       if det:
-        counts, nnz_counts, offsets, nnz_offsets, nefc_base, nnz_base = (
-          _alloc_scan_bufs(_dim)
-        )
+        counts, nnz_counts, offsets, nnz_offsets, nefc_base, nnz_base = _alloc_scan_bufs(_dim)
         wp.launch(
           _limit_tendon_count,
           dim=_dim,
@@ -3648,8 +3627,7 @@ def make_constraint(m: types.Model, d: types.Data):
           ],
           outputs=[counts, nnz_counts],
         )
-        _scan_launch(_dim, counts, nnz_counts, offsets, nnz_offsets,
-                     nefc_base, nnz_base)
+        _scan_launch(_dim, counts, nnz_counts, offsets, nnz_offsets, nefc_base, nnz_base)
       else:
         nefc_base, offsets, nnz_base, nnz_offsets = _d1, _d2, _d1, _d2
       wp.launch(
@@ -3727,8 +3705,7 @@ def make_constraint(m: types.Model, d: types.Data):
             _contact_per_world_scan,
             dim=d.nworld,
             inputs=[counts, nnz_counts, world_start, world_end],
-            outputs=[offsets, nnz_offsets, nefc_base, nnz_base,
-                     d.nefc, efc_nnz],
+            outputs=[d.nefc, efc_nnz, offsets, nnz_offsets, nefc_base, nnz_base],
           )
         else:
           nefc_base, offsets, nnz_base, nnz_offsets = _d1, _d2, _d1, _d2
@@ -3751,16 +3728,16 @@ def make_constraint(m: types.Model, d: types.Data):
             m.geom_bodyid,
             m.flex_vertadr,
             m.flex_vertbodyid,
-            nefc_base,
-            offsets,
-            nnz_base,
-            nnz_offsets,
             d.qvel,
             d.subtree_com,
             d.cdof,
             d.njmax,
             d.njmax_nnz,
             d.nacon,
+            nefc_base,
+            offsets,
+            nnz_base,
+            nnz_offsets,
             d.contact.dist,
             d.contact.dim,
             d.contact.includemargin,
@@ -3837,8 +3814,7 @@ def make_constraint(m: types.Model, d: types.Data):
             _contact_per_world_scan,
             dim=d.nworld,
             inputs=[counts, nnz_counts, world_start, world_end],
-            outputs=[offsets, nnz_offsets, nefc_base, nnz_base,
-                     d.nefc, efc_nnz],
+            outputs=[d.nefc, efc_nnz, offsets, nnz_offsets, nefc_base, nnz_base],
           )
         else:
           nefc_base, offsets, nnz_base, nnz_offsets = _d1, _d2, _d1, _d2
@@ -3861,16 +3837,16 @@ def make_constraint(m: types.Model, d: types.Data):
             m.geom_bodyid,
             m.flex_vertadr,
             m.flex_vertbodyid,
-            nefc_base,
-            offsets,
-            nnz_base,
-            nnz_offsets,
             d.qvel,
             d.subtree_com,
             d.cdof,
             d.njmax,
             d.njmax_nnz,
             d.nacon,
+            nefc_base,
+            offsets,
+            nnz_base,
+            nnz_offsets,
             d.contact.dist,
             d.contact.dim,
             d.contact.includemargin,
@@ -3917,7 +3893,5 @@ def make_constraint(m: types.Model, d: types.Data):
       efc_nnz_host = efc_nnz.numpy()
       if efc_nnz_host.max() > d.njmax_nnz:
         raise RuntimeError(
-          f"opt.deterministic: efc_nnz overflow "
-          f"(max={efc_nnz_host.max()}, njmax_nnz={d.njmax_nnz}). "
-          f"Increase njmax_nnz."
+          f"opt.deterministic: efc_nnz overflow (max={efc_nnz_host.max()}, njmax_nnz={d.njmax_nnz}). Increase njmax_nnz."
         )
