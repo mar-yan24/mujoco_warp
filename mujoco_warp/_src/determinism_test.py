@@ -21,8 +21,8 @@ from absl.testing import parameterized
 
 import mujoco_warp as mjw
 from mujoco_warp import test_data
-from mujoco_warp._src.benchmark import benchmark
 from mujoco_warp._src import collision_driver
+from mujoco_warp._src.benchmark import benchmark
 
 _NSTEPS = 10
 _CONTACT_FIELDS = (
