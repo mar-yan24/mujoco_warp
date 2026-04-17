@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Tests for GPU determinism (contact sorting + constraint row allocation)."""
+"""Tests for GPU determinism."""
 
 import numpy as np
 import warp as wp
@@ -21,8 +21,8 @@ from absl.testing import parameterized
 
 import mujoco_warp as mjw
 from mujoco_warp import test_data
-from mujoco_warp._src.benchmark import benchmark
 from mujoco_warp._src import collision_driver
+from mujoco_warp._src.benchmark import benchmark
 
 _NSTEPS = 10
 _CONTACT_FIELDS = (
@@ -427,6 +427,67 @@ class DeterminismBenchmarkCollectionTest(absltest.TestCase):
     self.assertLen(nacon, 2)
     self.assertLen(nefc, 2)
     self.assertEqual(nsuccess, d.nworld)
+
+
+_MOMENT_FIELDS = ("moment_rownnz", "moment_rowadr", "moment_colind", "actuator_moment")
+
+
+def _run_and_collect_moments(path, nworld, nsteps, deterministic):
+  """Run simulation and return moment sparse data from last step."""
+  _, _, m, d = test_data.fixture(path=path, nworld=nworld)
+  m.opt.deterministic = deterministic
+  for _ in range(nsteps):
+    mjw.step(m, d)
+  return {field: getattr(d, field).numpy().copy() for field in _MOMENT_FIELDS}
+
+
+class MomentAllocationDeterminismTest(parameterized.TestCase):
+  """Phase 3: tests that actuator moment allocation produces deterministic sparse rows."""
+
+  @parameterized.parameters(
+    ("humanoid/humanoid.xml", 1),
+    ("humanoid/humanoid.xml", 4),
+    ("actuation/site.xml", 1),
+    ("actuation/site.xml", 4),
+    ("actuation/slidercrank.xml", 1),
+  )
+  def test_moment_allocation_deterministic(self, path, nworld):
+    """moment_rowadr, moment_rownnz, moment_colind, actuator_moment are bitwise identical."""
+    nruns = 3
+    results = [_run_and_collect_moments(path, nworld, _NSTEPS, True) for _ in range(nruns)]
+
+    for run in range(1, nruns):
+      for field in _MOMENT_FIELDS:
+        np.testing.assert_array_equal(
+          results[0][field],
+          results[run][field],
+          err_msg=f"{field} differs: run 0 vs run {run} ({path}, nworld={nworld})",
+        )
+
+  @parameterized.parameters(
+    ("humanoid/humanoid.xml", 16),
+  )
+  def test_moment_large_nworld_deterministic(self, path, nworld):
+    """Larger nworld cases stay bitwise stable in deterministic mode."""
+    nruns = 2
+    results = [_run_and_collect_moments(path, nworld, _NSTEPS, True) for _ in range(nruns)]
+
+    for field in _MOMENT_FIELDS:
+      np.testing.assert_array_equal(
+        results[0][field],
+        results[1][field],
+        err_msg=f"{field} differs ({path}, nworld={nworld})",
+      )
+
+  def test_nondet_moment_path_unaffected(self):
+    """Non-deterministic mode still works without crash for actuator models."""
+    _, _, m, d = test_data.fixture(path="humanoid/humanoid.xml", nworld=1)
+    m.opt.deterministic = False
+    for _ in range(_NSTEPS):
+      mjw.step(m, d)
+    moment = d.actuator_moment.numpy()
+    self.assertFalse(np.any(np.isnan(moment)), "NaN in actuator_moment")
+    self.assertFalse(np.any(np.isinf(moment)), "Inf in actuator_moment")
 
 
 if __name__ == "__main__":
