@@ -23,7 +23,6 @@ from mujoco_warp._src.types import ContactType
 from mujoco_warp._src.types import DisableBit
 from mujoco_warp._src.types import vec5
 from mujoco_warp._src.types import vec11
-from mujoco_warp._src.warp_util import cache_kernel
 from mujoco_warp._src.warp_util import event_scope
 
 wp.set_module_options({"enable_backward": False})
@@ -378,7 +377,6 @@ def _equality_connect_count(
     nnz_count_out[worldid, eqconnectid] = 0
 
 
-@cache_kernel
 def _equality_connect(is_sparse: bool, deterministic: bool):
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
@@ -663,7 +661,6 @@ def _equality_joint_count(
     nnz_count_out[worldid, eqjntid] = 0
 
 
-@cache_kernel
 def _equality_joint(is_sparse: bool, deterministic: bool):
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
@@ -844,7 +841,6 @@ def _equality_tendon_count(
     nnz_count_out[worldid, eqtenid] = 0
 
 
-@cache_kernel
 def _equality_tendon(is_sparse: bool, deterministic: bool):
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
@@ -1066,7 +1062,6 @@ def _equality_flex_count(
     nnz_count_out[worldid, localid] = 0
 
 
-@cache_kernel
 def _equality_flex(is_sparse: bool, deterministic: bool):
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
@@ -1240,7 +1235,6 @@ def _equality_weld_count(
     nnz_count_out[worldid, eqweldid] = 0
 
 
-@cache_kernel
 def _equality_weld(is_sparse: bool, deterministic: bool):
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
@@ -1597,7 +1591,6 @@ def _friction_dof_count(
     nnz_count_out[worldid, dofid] = 0
 
 
-@cache_kernel
 def _friction_dof(is_sparse: bool, deterministic: bool):
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
@@ -1726,7 +1719,6 @@ def _friction_tendon_count(
     nnz_count_out[worldid, tenid] = 0
 
 
-@cache_kernel
 def _friction_tendon(is_sparse: bool, deterministic: bool):
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
@@ -1890,7 +1882,6 @@ def _limit_slide_hinge_count(
     nnz_count_out[worldid, jntlimitedid] = 0
 
 
-@cache_kernel
 def _limit_slide_hinge(is_sparse: bool, deterministic: bool):
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
@@ -2048,7 +2039,6 @@ def _limit_ball_count(
     nnz_count_out[worldid, jntlimitedid] = 0
 
 
-@cache_kernel
 def _limit_ball(is_sparse: bool, deterministic: bool):
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
@@ -2222,7 +2212,6 @@ def _limit_tendon_count(
     nnz_count_out[worldid, tenlimitedid] = 0
 
 
-@cache_kernel
 def _limit_tendon(is_sparse: bool, deterministic: bool):
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
@@ -2441,7 +2430,6 @@ def _contact_pyramidal_count(
     nnz_count_out[conid, dimid] = 0
 
 
-@cache_kernel
 def _contact_pyramidal(is_sparse: bool, deterministic: bool):
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
@@ -2806,7 +2794,6 @@ def _contact_elliptic_count(
     nnz_count_out[conid, dimid] = 0
 
 
-@cache_kernel
 def _contact_elliptic(is_sparse: bool, deterministic: bool):
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
