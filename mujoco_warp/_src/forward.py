@@ -18,6 +18,7 @@ from typing import Optional
 import warp as wp
 
 from mujoco_warp._src import collision_driver
+from mujoco_warp._src import collision_smooth
 from mujoco_warp._src import constraint
 from mujoco_warp._src import derivative
 from mujoco_warp._src import island
@@ -26,7 +27,9 @@ from mujoco_warp._src import passive
 from mujoco_warp._src import sensor
 from mujoco_warp._src import smooth
 from mujoco_warp._src import solver
+from mujoco_warp._src import support
 from mujoco_warp._src import util_misc
+from mujoco_warp._src.support import next_act
 from mujoco_warp._src.support import xfrc_accumulate
 from mujoco_warp._src.types import MJ_MINVAL
 from mujoco_warp._src.types import BiasType
@@ -128,37 +131,6 @@ def _next_velocity(
   qvel_out[worldid, dofid] = qvel_in[worldid, dofid] + qacc_scale_in * qacc_in[worldid, dofid] * timestep
 
 
-# TODO(team): kernel analyzer array slice?
-@wp.func
-def _next_act(
-  # Model:
-  opt_timestep: float,  # kernel_analyzer: ignore
-  actuator_dyntype: int,  # kernel_analyzer: ignore
-  actuator_dynprm: vec10f,  # kernel_analyzer: ignore
-  actuator_actrange: wp.vec2,  # kernel_analyzer: ignore
-  # Data In:
-  act_in: float,  # kernel_analyzer: ignore
-  act_dot_in: float,  # kernel_analyzer: ignore
-  # In:
-  act_dot_scale: float,
-  clamp: bool,
-) -> float:
-  # advance actuation
-  if actuator_dyntype == DynType.FILTEREXACT:
-    tau = wp.max(MJ_MINVAL, actuator_dynprm[0])
-    act = act_in + act_dot_scale * act_dot_in * tau * (1.0 - wp.exp(-opt_timestep / tau))
-  elif actuator_dyntype == DynType.USER:
-    return act_in
-  else:
-    act = act_in + act_dot_scale * act_dot_in * opt_timestep
-
-  # clamp to actrange
-  if clamp:
-    act = wp.clamp(act, actuator_actrange[0], actuator_actrange[1])
-
-  return act
-
-
 @wp.kernel
 def _next_activation(
   # Model:
@@ -185,7 +157,7 @@ def _next_activation(
   actadr = actuator_actadr[uid]
   actnum = actuator_actnum[uid]
   for j in range(actadr, actadr + actnum):
-    act = _next_act(
+    act = next_act(
       opt_timestep[opt_timestep_id],
       actuator_dyntype[uid],
       actuator_dynprm[actuator_dynprm_id, uid],
@@ -308,7 +280,15 @@ def _advance(m: Model, d: Data, qacc: wp.array, qvel: Optional[wp.array] = None)
     outputs=[d.time],
   )
 
-  wp.copy(d.qacc_warmstart, d.qacc)
+  # Use _nograd_copy: warmstart is a numerical hint, not a gradient path.
+  # wp.copy would be tracked on the tape and create cross-substep gradient
+  # leaks through the shared d.qacc_warmstart array.
+  wp.launch(
+    support._nograd_copy,
+    dim=(d.nworld, qacc.shape[1]),
+    inputs=[qacc],
+    outputs=[d.qacc_warmstart],
+  )
 
 
 @wp.kernel
@@ -325,6 +305,20 @@ def _euler_damp_qfrc_sparse(
 
   adr = dof_Madr[tid]
   qM_integration_out[worldid, 0, adr] += timestep * dof_damping[worldid % dof_damping.shape[0], tid]
+
+
+@wp.kernel
+def _euler_damp_qfrc_dense(
+  # Model:
+  opt_timestep: wp.array(dtype=float),
+  dof_damping: wp.array2d(dtype=float),
+  # Out:
+  qM_integration_out: wp.array3d(dtype=float),
+):
+  """Add dt * damping to diagonal of dense (nworld, nv, nv) mass matrix."""
+  worldid, tid = wp.tid()
+  timestep = opt_timestep[worldid % opt_timestep.shape[0]]
+  qM_integration_out[worldid, tid, tid] += timestep * dof_damping[worldid % dof_damping.shape[0], tid]
 
 
 @cache_kernel
@@ -365,11 +359,12 @@ def euler(m: Model, d: Data):
   """Euler integrator, semi-implicit in velocity."""
   # integrate damping implicitly
   if not (m.opt.disableflags & (DisableBit.EULERDAMP | DisableBit.DAMPER)):
-    qacc = wp.empty((d.nworld, m.nv), dtype=float)
+    ad_active = d.qpos.requires_grad
+    qacc = wp.empty((d.nworld, m.nv), dtype=float, requires_grad=ad_active)
     if m.is_sparse:
       qM = wp.clone(d.qM)
-      qLD = wp.empty((d.nworld, 1, m.nC), dtype=float)
-      qLDiagInv = wp.empty((d.nworld, m.nv), dtype=float)
+      qLD = wp.empty((d.nworld, 1, m.nC), dtype=float, requires_grad=ad_active)
+      qLDiagInv = wp.empty((d.nworld, m.nv), dtype=float, requires_grad=ad_active)
       wp.launch(
         _euler_damp_qfrc_sparse,
         dim=(d.nworld, m.nv),
@@ -386,8 +381,11 @@ def euler(m: Model, d: Data):
           outputs=[qacc],
           block_dim=m.block_dim.euler_dense,
         )
+    _record_solver_adjoint(m, d, qacc_array=qacc)
+    _record_euler_damp_adjoint(m, d, qacc)
     _advance(m, d, qacc)
   else:
+    _record_solver_adjoint(m, d, qacc_array=d.qacc)
     _advance(m, d, d.qacc)
 
 
@@ -498,14 +496,15 @@ def rungekutta4(m: Model, d: Data):
   A = [0.5, 0.5, 1.0]  # diagonal only
   B = [1.0 / 6.0, 1.0 / 3.0, 1.0 / 3.0, 1.0 / 6.0]
 
+  ad_active = d.qpos.requires_grad
   qpos_t0 = wp.clone(d.qpos)
   qvel_t0 = wp.clone(d.qvel)
-  qvel_rk = wp.zeros((d.nworld, m.nv), dtype=float)
-  qacc_rk = wp.zeros((d.nworld, m.nv), dtype=float)
+  qvel_rk = wp.zeros((d.nworld, m.nv), dtype=float, requires_grad=ad_active)
+  qacc_rk = wp.zeros((d.nworld, m.nv), dtype=float, requires_grad=ad_active)
 
   if m.na:
     act_t0 = wp.clone(d.act)
-    act_dot_rk = wp.zeros((d.nworld, m.na), dtype=float)
+    act_dot_rk = wp.zeros((d.nworld, m.na), dtype=float, requires_grad=ad_active)
   else:
     act_t0 = None
     act_dot_rk = None
@@ -525,6 +524,7 @@ def rungekutta4(m: Model, d: Data):
     wp.copy(d.act, act_t0)
     wp.copy(d.act_dot, act_dot_rk)
 
+  _record_solver_adjoint(m, d, qacc_array=qacc_rk)
   _advance(m, d, qacc_rk, qvel_rk)
 
 
@@ -532,6 +532,7 @@ def rungekutta4(m: Model, d: Data):
 def implicit(m: Model, d: Data):
   """Integrates fully implicit in velocity."""
   if ~(m.opt.disableflags | ~(DisableBit.ACTUATION | DisableBit.SPRING | DisableBit.DAMPER)):
+    ad_active = d.qpos.requires_grad
     if m.is_sparse:
       qDeriv = wp.empty((d.nworld, 1, m.nM), dtype=float)
       qLD = wp.empty((d.nworld, 1, m.nC), dtype=float)
@@ -540,10 +541,12 @@ def implicit(m: Model, d: Data):
       qLD = wp.empty(d.qM.shape, dtype=float)
     qLDiagInv = wp.empty((d.nworld, m.nv), dtype=float)
     derivative.deriv_smooth_vel(m, d, qDeriv)
-    qacc = wp.empty((d.nworld, m.nv), dtype=float)
+    qacc = wp.empty((d.nworld, m.nv), dtype=float, requires_grad=ad_active)
     smooth.factor_solve_i(m, d, qDeriv, qLD, qLDiagInv, qacc, d.efc.Ma)
+    _record_solver_adjoint(m, d, qacc_array=qacc)
     _advance(m, d, qacc)
   else:
+    _record_solver_adjoint(m, d, qacc_array=d.qacc)
     _advance(m, d, d.qacc)
 
 
@@ -567,7 +570,15 @@ def fwd_position(m: Model, d: Data, factorize: bool = True):
     smooth.factor_m(m, d)
   if m.opt.run_collision_detection:
     collision_driver.collision(m, d)
+    # Phase 3: smooth collision recomputation for AD
+    tape = wp._src.context.runtime.tape
+    if tape is not None and d.qpos.requires_grad:
+      collision_smooth.smooth_recompute_contacts(m, d)
   constraint.make_constraint(m, d)
+  # Phase 3: differentiable constraint assembly for AD
+  tape = wp._src.context.runtime.tape
+  if tape is not None and d.qpos.requires_grad:
+    collision_smooth.smooth_contact_to_efc(m, d)
   # TODO(team): remove False after island features are more complete
   if False and not (m.opt.disableflags & DisableBit.ISLAND):
     island.island(m, d)
@@ -720,7 +731,7 @@ def _actuator_force(
       if dyntype == DynType.INTEGRATOR or dyntype == DynType.NONE:
         act = act_in[worldid, act_last]
 
-      ctrl_act = _next_act(
+      ctrl_act = next_act(
         opt_timestep[worldid % opt_timestep.shape[0]],
         dyntype,
         dynprm,
@@ -950,11 +961,7 @@ def fwd_actuation(m: Model, d: Data):
   )
   # clone to break input/output aliasing for correct AD; skip when not
   # recording a backward tape to avoid unnecessary allocation + copy.
-  qfrc_actuator_in = (
-      wp.clone(d.qfrc_actuator)
-      if d.qfrc_actuator.requires_grad
-      else d.qfrc_actuator
-  )
+  qfrc_actuator_in = wp.clone(d.qfrc_actuator) if d.qfrc_actuator.requires_grad else d.qfrc_actuator
   wp.launch(
     _qfrc_actuator_gravcomp_limits,
     dim=(d.nworld, m.nv),
@@ -1012,10 +1019,166 @@ def fwd_acceleration(m: Model, d: Data, factorize: bool = False):
   else:
     smooth.solve_m(m, d, d.qacc_smooth, d.qfrc_smooth)
 
+  # Custom adjoint for M_inv solve on the dense path.
+  # The tile Cholesky kernels have enable_backward=False, so the tape cannot
+  # propagate qacc_smooth.grad -> qfrc_smooth.grad automatically.  We record
+  # a callback that performs the VJP: qfrc_smooth.grad += M_inv * qacc_smooth.grad
+  # (M is symmetric so M_inv^T = M_inv).
+  _record_fwd_accel_adjoint(m, d)
+
+
+def _record_fwd_accel_adjoint(m: Model, d: Data):
+  """Record custom adjoint for the M_inv solve in fwd_acceleration.
+
+  On the dense path, _tile_cholesky_factorize_solve has enable_backward=False.
+  This record_func propagates qacc_smooth.grad -> qfrc_smooth.grad via M_inv,
+  using the already-factored d.qLD from the forward pass.
+
+  Array references are captured at record time (not through d) so that
+  intermediate array cloning between substeps routes each substep's adjoint
+  to the correct .grad memory.
+  """
+  tape = wp._src.context.runtime.tape
+  if tape is not None and d.qpos.requires_grad:
+    from mujoco_warp._src.adjoint import _accumulate_grad_kernel
+
+    # Capture current array refs for correct gradient isolation across substeps
+    qacc_smooth_ref = d.qacc_smooth
+    qfrc_smooth_ref = d.qfrc_smooth
+
+    def _adjoint(m=m, d=d, qacc_smooth=qacc_smooth_ref, qfrc_smooth=qfrc_smooth_ref):
+      adj_qacc_smooth = qacc_smooth.grad
+      if adj_qacc_smooth is None:
+        return
+
+      # qfrc_smooth.grad += M_inv * qacc_smooth.grad
+      tmp = wp.zeros_like(qfrc_smooth)
+      smooth.solve_m(m, d, tmp, adj_qacc_smooth)
+      if qfrc_smooth.grad is None:
+        qfrc_smooth.grad = tmp
+      else:
+        wp.launch(
+          _accumulate_grad_kernel,
+          dim=(d.nworld, m.nv),
+          inputs=[tmp],
+          outputs=[qfrc_smooth.grad],
+        )
+
+    tape.record_func(_adjoint, [qacc_smooth_ref, qfrc_smooth_ref])
+
+
+def _record_solver_adjoint(m: Model, d: Data, qacc_array=None):
+  """Record the solver implicit differentiation adjoint on the active tape.
+
+  Args:
+    m: Model containing static simulation parameters.
+    d: Data containing mutable simulation state.
+    qacc_array: The array whose .grad will receive the incoming adjoint from
+                the integrator backward. Defaults to d.qacc (correct when
+                the integrator uses d.qacc directly, e.g. eulerdamp disabled).
+                Integrators that create a local qacc must pass it here.
+
+  Array references are captured at record time so that intermediate array
+  cloning between substeps routes each substep's adjoint correctly.
+  """
+  tape = wp._src.context.runtime.tape
+  if tape is not None and d.qpos.requires_grad:
+    if qacc_array is None:
+      qacc_array = d.qacc
+
+    # Capture qacc_smooth ref at record time for gradient isolation
+    qacc_smooth_ref = d.qacc_smooth
+
+    if getattr(d, "smooth_adjoint", 0):
+      from mujoco_warp._src.adjoint import solver_smooth_adjoint
+
+      tape.record_func(
+        lambda m=m, d=d, qa=qacc_array, qs=qacc_smooth_ref: solver_smooth_adjoint(m, d, qacc_array=qa, qacc_smooth_ref=qs),
+        [qacc_array, qacc_smooth_ref],
+      )
+    else:
+      from mujoco_warp._src.adjoint import solver_implicit_adjoint
+
+      tape.record_func(
+        lambda m=m, d=d, qa=qacc_array, qs=qacc_smooth_ref: solver_implicit_adjoint(m, d, qacc_array=qa, qacc_smooth_ref=qs),
+        [qacc_array, qacc_smooth_ref],
+      )
+
+
+def _record_euler_damp_adjoint(m: Model, d: Data, qacc: wp.array):
+  """Record euler-damping adjoint transformation on the active tape.
+
+  During backward, transforms qacc.grad from the raw integrator adjoint
+  into the correct adjoint that accounts for the (M+dt*D)^{-1}*M
+  transformation in the euler implicit damping solve.
+
+  Forward:  qacc_local = (M + dt*D)^{-1} * M * d.qacc
+  Adjoint:  adj_d_qacc = M * (M + dt*D)^{-1} * adj_qacc_local
+
+  This callback runs between _advance backward (which sets qacc.grad)
+  and _record_solver_adjoint backward (which reads qacc.grad).
+  """
+  tape = wp._src.context.runtime.tape
+  if tape is None or not d.qpos.requires_grad:
+    return
+
+  # Capture the forward-pass mass matrix reference at record time.
+  # _isolate_intermediates_for_ad() allocates fresh d.qM each substep,
+  # so this captures the correct per-substep mass matrix.
+  qM_ref = d.qM
+  qacc_ref = qacc
+
+  def _adjoint(m=m, d=d, qM=qM_ref, qacc_arr=qacc_ref):
+    adj_qacc = qacc_arr.grad
+    if adj_qacc is None:
+      return
+
+    nv = m.nv
+
+    # Step 1: Construct M_damp = M + dt*D
+    qM_damp = wp.clone(qM)
+    if m.is_sparse:
+      wp.launch(
+        _euler_damp_qfrc_sparse,
+        dim=(d.nworld, nv),
+        inputs=[m.opt.timestep, m.dof_Madr, m.dof_damping],
+        outputs=[qM_damp],
+      )
+    else:
+      wp.launch(
+        _euler_damp_qfrc_dense,
+        dim=(d.nworld, nv),
+        inputs=[m.opt.timestep, m.dof_damping],
+        outputs=[qM_damp],
+      )
+
+    # Step 2: Solve (M + dt*D) * tmp = adj_qacc
+    qLD_tmp = wp.zeros_like(d.qLD)
+    qLDiagInv_tmp = wp.zeros((d.nworld, nv), dtype=float)
+    tmp = wp.zeros((d.nworld, nv), dtype=float)
+    smooth.factor_solve_i(m, d, qM_damp, qLD_tmp, qLDiagInv_tmp, tmp, adj_qacc)
+
+    # Step 3: result = M * tmp (using original undamped mass matrix)
+    result = wp.zeros((d.nworld, nv), dtype=float)
+    support.mul_m(m, d, result, tmp, M=qM)
+
+    # Step 4: Overwrite qacc.grad with the corrected adjoint
+    wp.copy(qacc_arr.grad, result)
+
+  tape.record_func(_adjoint, [qacc_ref])
+
 
 @event_scope
-def forward(m: Model, d: Data):
-  """Forward dynamics."""
+def forward(m: Model, d: Data, record_solver_adjoint: bool = True):
+  """Forward dynamics.
+
+  Args:
+    m: Model containing static simulation parameters.
+    d: Data containing mutable simulation state.
+    record_solver_adjoint: If True, record the solver implicit differentiation
+        adjoint on the tape. Set to False when called from step() since the
+        integrator records its own adjoint at the correct tape position.
+  """
   energy = m.opt.enableflags & EnableBit.ENERGY
 
   fwd_position(m, d, factorize=False)
@@ -1042,17 +1205,89 @@ def forward(m: Model, d: Data):
 
   solver.solve(m, d)
 
-  # Record implicit differentiation adjoint on the active tape
-  tape = wp._src.context.runtime.tape
-  if tape is not None and d.qpos.requires_grad:
-    from mujoco_warp._src.adjoint import solver_implicit_adjoint
-
-    tape.record_func(
-      lambda m=m, d=d: solver_implicit_adjoint(m, d),
-      [d.qacc, d.qacc_smooth],
-    )
+  # Record implicit differentiation adjoint on the active tape.
+  # When called from step(), the integrator handles this instead (at the
+  # correct tape position between factor_solve_i and _advance).
+  if record_solver_adjoint:
+    _record_solver_adjoint(m, d)
 
   sensor.sensor_acc(m, d)
+
+
+def _isolate_intermediates_for_ad(m: Model, d: Data):
+  """Allocate fresh intermediate arrays for per-substep gradient isolation.
+
+  In tape-all mode (single wp.Tape over multiple step() calls), intermediate
+  arrays like qfrc_smooth and qacc_smooth are overwritten each substep but
+  share a single .grad array. This causes backward to accumulate adjoint
+  contributions from ALL substeps into the same memory (~250,000x amplification
+  for 16 substeps).
+
+  By allocating fresh arrays at the start of each step(), each substep writes
+  to its own memory. The tape records operations on these unique arrays, and
+  backward routes each substep's adjoint to the correct .grad memory.
+
+  Only called when AD is active on an active tape.
+
+  Every array here appears as an output of wp.launch in the pipeline. If
+  shared across substeps, Warp's adjoint zeroes the output .grad during
+  the later substep's backward, corrupting the earlier substep's gradient
+  chain.  The allocation overhead is ~25KB/step (negligible for GPU).
+  """
+
+  def _clone_with_grad(arr):
+    """Clone arrays that contain static world data and preserve gradients."""
+    cloned = wp.clone(arr)
+    cloned.requires_grad = True
+    return cloned
+
+  nw = d.nworld
+  nv = m.nv
+  nu = m.nu
+
+  # --- Force arrays ---
+  d.qfrc_smooth = wp.zeros((nw, nv), dtype=float, requires_grad=True)
+  d.qacc_smooth = wp.zeros((nw, nv), dtype=float, requires_grad=True)
+  d.qfrc_actuator = wp.zeros((nw, nv), dtype=float, requires_grad=True)
+  d.actuator_force = wp.zeros((nw, nu), dtype=float, requires_grad=True)
+  d.qacc = wp.zeros((nw, nv), dtype=float, requires_grad=True)
+  d.qfrc_bias = wp.zeros((nw, nv), dtype=float, requires_grad=True)
+  d.qfrc_passive = wp.zeros((nw, nv), dtype=float, requires_grad=True)
+
+  # --- Kinematics arrays ---
+  # These use Warp vector/matrix dtypes (vec3, mat33, etc.) so use
+  # zeros_like to match the exact dtype and shape from the existing arrays.
+  d.xpos = wp.zeros_like(d.xpos, requires_grad=True)
+  # Preserve rows that are only initialized once, such as the world body.
+  d.xmat = _clone_with_grad(d.xmat)
+  d.xipos = wp.zeros_like(d.xipos, requires_grad=True)
+  d.ximat = _clone_with_grad(d.ximat)
+  d.subtree_com = wp.zeros_like(d.subtree_com, requires_grad=True)
+  d.cinert = wp.zeros_like(d.cinert, requires_grad=True)
+  d.cdof = wp.zeros_like(d.cdof, requires_grad=True)
+  d.cdof_dot = wp.zeros_like(d.cdof_dot, requires_grad=True)
+  d.cvel = wp.zeros_like(d.cvel, requires_grad=True)
+  d.crb = wp.zeros_like(d.crb, requires_grad=True)
+  d.cacc = wp.zeros_like(d.cacc, requires_grad=True)
+
+  # --- Mass matrix ---
+  # Shapes depend on sparse vs dense; zeros_like handles both.
+  d.qM = wp.zeros_like(d.qM, requires_grad=True)
+  d.qLD = wp.zeros_like(d.qLD, requires_grad=True)
+  d.qLDiagInv = wp.zeros((nw, nv), dtype=float, requires_grad=True)
+
+  # --- Geometry / joint kinematics ---
+  # Static world geoms are not recomputed in smooth._geom_local_to_global(),
+  # so keep their initialized transforms while giving each step unique storage.
+  d.geom_xpos = _clone_with_grad(d.geom_xpos)
+  d.geom_xmat = _clone_with_grad(d.geom_xmat)
+  d.xanchor = wp.zeros_like(d.xanchor, requires_grad=True)
+  d.xaxis = wp.zeros_like(d.xaxis, requires_grad=True)
+  d.subtree_linvel = wp.zeros_like(d.subtree_linvel, requires_grad=True)
+  d.subtree_angmom = wp.zeros_like(d.subtree_angmom, requires_grad=True)
+
+  # --- Actuator arrays ---
+  d.actuator_velocity = wp.zeros((nw, nu), dtype=float, requires_grad=True)
 
 
 @event_scope
@@ -1060,7 +1295,14 @@ def step(m: Model, d: Data):
   """Advance simulation."""
   # TODO(team): mj_checkPos
   # TODO(team): mj_checkVel
-  forward(m, d)
+
+  # Allocate fresh intermediate arrays only while recording on a tape. Forward
+  # rollouts on diff data still need the initialized static transforms.
+  tape = wp._src.context.runtime.tape
+  if d.qpos.requires_grad and tape is not None:
+    _isolate_intermediates_for_ad(m, d)
+
+  forward(m, d, record_solver_adjoint=False)
   # TODO(team): mj_checkAcc
 
   if m.opt.integrator == IntegratorType.EULER:
@@ -1108,15 +1350,8 @@ def step2(m: Model, d: Data):
   fwd_acceleration(m, d)
   solver.solve(m, d)
 
-  # Record implicit differentiation adjoint on the active tape
-  tape = wp._src.context.runtime.tape
-  if tape is not None and d.qpos.requires_grad:
-    from mujoco_warp._src.adjoint import solver_implicit_adjoint
-
-    tape.record_func(
-      lambda m=m, d=d: solver_implicit_adjoint(m, d),
-      [d.qacc, d.qacc_smooth],
-    )
+  # The solver adjoint record_func is handled by the integrator below,
+  # NOT here — see euler()/implicit() for details.
 
   sensor.sensor_acc(m, d)
   # TODO(team): mj_checkAcc
